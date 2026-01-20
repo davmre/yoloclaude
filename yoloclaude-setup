@@ -1,0 +1,230 @@
+#!/bin/bash
+#
+# yoloclaude-setup - One-time setup for yoloclaude sandboxed Claude Code environment
+#
+# This script creates a 'claude' user account with appropriate permissions
+# for running Claude Code in a sandboxed environment.
+#
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root (use sudo)"
+    fi
+}
+
+# Detect platform
+detect_platform() {
+    case "$(uname -s)" in
+        Darwin*)
+            PLATFORM="macos"
+            ;;
+        Linux*)
+            PLATFORM="linux"
+            ;;
+        *)
+            error "Unsupported platform: $(uname -s)"
+            ;;
+    esac
+    info "Detected platform: $PLATFORM"
+}
+
+# Check if claude user already exists
+user_exists() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        dscl . -read /Users/claude &>/dev/null
+    else
+        id claude &>/dev/null
+    fi
+}
+
+# Get the invoking user (the one who ran sudo)
+get_invoking_user() {
+    INVOKING_USER="${SUDO_USER:-$USER}"
+    if [[ "$INVOKING_USER" == "root" ]]; then
+        error "Cannot determine invoking user. Please run with 'sudo' from a regular user account."
+    fi
+    info "Invoking user: $INVOKING_USER"
+}
+
+# Create claude user on macOS
+create_user_macos() {
+    info "Creating claude user on macOS..."
+
+    # Find an available UID (start at 550 to avoid conflicts)
+    local uid=550
+    while dscl . -list /Users UniqueID | grep -q "\\b$uid\\b"; do
+        ((uid++))
+    done
+
+    # Create the user
+    dscl . -create /Users/claude
+    dscl . -create /Users/claude UserShell /bin/bash
+    dscl . -create /Users/claude RealName "Claude Code Sandbox"
+    dscl . -create /Users/claude UniqueID "$uid"
+    dscl . -create /Users/claude PrimaryGroupID 20  # staff group
+    dscl . -create /Users/claude NFSHomeDirectory /Users/claude
+
+    # Create home directory
+    createhomedir -c -u claude 2>/dev/null || mkdir -p /Users/claude
+    chown -R claude:staff /Users/claude
+
+    # Hide user from login screen
+    dscl . -create /Users/claude IsHidden 1
+
+    info "Created claude user with UID $uid"
+}
+
+# Create claude user on Linux
+create_user_linux() {
+    info "Creating claude user on Linux..."
+
+    # Create system user with home directory
+    useradd --system --create-home --shell /bin/bash --comment "Claude Code Sandbox" claude
+
+    info "Created claude user"
+}
+
+# Create directory structure
+create_directories() {
+    info "Creating directory structure..."
+
+    local claude_home
+    if [[ "$PLATFORM" == "macos" ]]; then
+        claude_home="/Users/claude"
+    else
+        claude_home="/home/claude"
+    fi
+
+    mkdir -p "$claude_home/projects"
+    mkdir -p "$claude_home/.yoloclaude"
+
+    chown -R claude:$(id -gn claude) "$claude_home"
+
+    info "Created $claude_home/projects and $claude_home/.yoloclaude"
+}
+
+# Configure sudo rules
+configure_sudo() {
+    info "Configuring sudo rules..."
+
+    local sudoers_file="/etc/sudoers.d/yoloclaude"
+
+    # Create sudoers rule allowing invoking user to run commands as claude without password
+    cat > "$sudoers_file" << EOF
+# Allow $INVOKING_USER to run commands as claude without password
+$INVOKING_USER ALL=(claude) NOPASSWD: ALL
+EOF
+
+    chmod 440 "$sudoers_file"
+
+    # Validate sudoers file
+    if ! visudo -c -f "$sudoers_file" &>/dev/null; then
+        rm -f "$sudoers_file"
+        error "Failed to create valid sudoers file"
+    fi
+
+    info "Created $sudoers_file"
+}
+
+# Set up git config for claude user
+setup_git_config() {
+    info "Setting up git configuration for claude user..."
+
+    local claude_home
+    if [[ "$PLATFORM" == "macos" ]]; then
+        claude_home="/Users/claude"
+    else
+        claude_home="/home/claude"
+    fi
+
+    # Create .gitconfig
+    sudo -u claude git config --global user.name "Claude Code"
+    sudo -u claude git config --global user.email "claude@localhost"
+    sudo -u claude git config --global init.defaultBranch main
+
+    # Allow claude to access repos owned by other users
+    # This is needed because claude clones from the invoking user's local repos
+    sudo -u claude git config --global safe.directory '*'
+
+    info "Configured git for claude user"
+}
+
+# Print final instructions
+print_instructions() {
+    local claude_home
+    if [[ "$PLATFORM" == "macos" ]]; then
+        claude_home="/Users/claude"
+    else
+        claude_home="/home/claude"
+    fi
+
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}Setup complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Next steps:"
+    echo ""
+    echo "1. Authenticate Claude Code for the claude user:"
+    echo "   sudo -u claude -i claude"
+    echo ""
+    echo "   This will open Claude Code and prompt you to log in."
+    echo "   Complete the authentication, then exit with /exit or Ctrl+C."
+    echo ""
+    echo "2. Start using yoloclaude:"
+    echo "   yoloclaude https://github.com/user/repo"
+    echo "   yoloclaude /path/to/local/repo"
+    echo ""
+    echo "The claude user's home directory is: $claude_home"
+    echo "Projects will be cloned to: $claude_home/projects/"
+    echo ""
+}
+
+# Main
+main() {
+    echo "yoloclaude-setup - Setting up Claude Code sandbox environment"
+    echo ""
+
+    check_root
+    detect_platform
+    get_invoking_user
+
+    if user_exists; then
+        warn "User 'claude' already exists. Skipping user creation."
+    else
+        if [[ "$PLATFORM" == "macos" ]]; then
+            create_user_macos
+        else
+            create_user_linux
+        fi
+    fi
+
+    create_directories
+    configure_sudo
+    setup_git_config
+    print_instructions
+}
+
+main "$@"

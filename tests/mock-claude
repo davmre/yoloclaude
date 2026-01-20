@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# mock-claude - Simulates Claude Code for testing yoloclaude
+#
+# This script mimics Claude Code's behavior:
+# - Accepts --dangerously-skip-permissions flag
+# - Makes some changes to files
+# - Creates git commits
+# - Exits cleanly
+#
+
+set -e
+
+echo "=== Mock Claude Code ==="
+echo "Arguments: $@"
+echo "Working directory: $(pwd)"
+echo "Running as user: $(whoami)"
+echo ""
+
+# Check for expected flags
+SKIP_PERMISSIONS=false
+for arg in "$@"; do
+    if [[ "$arg" == "--dangerously-skip-permissions" ]]; then
+        SKIP_PERMISSIONS=true
+    fi
+done
+
+if [[ "$SKIP_PERMISSIONS" != "true" ]]; then
+    echo "Warning: --dangerously-skip-permissions not provided"
+fi
+
+# Simulate some work
+echo "Simulating Claude Code session..."
+
+# Check if we're in a git repo
+if [[ ! -d .git ]]; then
+    echo "Error: Not in a git repository"
+    exit 1
+fi
+
+# Create a test file
+TEST_FILE="claude-test-$(date +%s).txt"
+echo "Mock Claude was here at $(date)" > "$TEST_FILE"
+echo "Created file: $TEST_FILE"
+
+# Stage and commit
+git add "$TEST_FILE"
+git commit -m "test: Add $TEST_FILE from mock Claude
+
+This commit was created by the mock Claude script for testing purposes.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
+
+echo ""
+echo "Commit created successfully."
+echo ""
+
+# Optionally make a second commit to test multiple commits
+if [[ -n "$MOCK_CLAUDE_EXTRA_COMMITS" ]]; then
+    EXTRA_FILE="extra-change-$(date +%s).txt"
+    echo "Extra changes" > "$EXTRA_FILE"
+    git add "$EXTRA_FILE"
+    git commit -m "test: Add extra file $EXTRA_FILE"
+    echo "Created additional commit."
+fi
+
+echo "=== Mock Claude Code session complete ==="
+exit 0

@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""
+yoloclaude - Run Claude Code in a sandboxed user environment
+
+This script wraps Claude Code to run it as a separate 'claude' user,
+providing containment through Unix permissions while allowing the agent
+freedom to install packages and modify files within its own environment.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+# ANSI colors
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    NC = '\033[0m'  # No Color
+
+
+def info(msg: str) -> None:
+    print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}")
+
+
+def error(msg: str) -> None:
+    print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}")
+    sys.exit(1)
+
+
+# Global flag for non-interactive mode
+AUTO_YES = False
+
+
+def prompt(msg: str) -> str:
+    """Prompt user for input."""
+    return input(f"{Colors.CYAN}[?]{Colors.NC} {msg}: ")
+
+
+def prompt_yes_no(msg: str, default: bool = True) -> bool:
+    """Prompt user for yes/no answer. In auto-yes mode, always returns True."""
+    if AUTO_YES:
+        info(f"{msg} [auto-yes]")
+        return True
+    suffix = "[Y/n]" if default else "[y/N]"
+    response = input(f"{Colors.CYAN}[?]{Colors.NC} {msg} {suffix}: ").strip().lower()
+    if not response:
+        return default
+    return response in ('y', 'yes')
+
+
+def get_claude_home() -> Path:
+    """Get the claude user's home directory."""
+    if sys.platform == "darwin":
+        return Path("/Users/claude")
+    return Path("/home/claude")
+
+
+def get_user_repos_dir() -> Path:
+    """Get the invoking user's repos directory."""
+    return Path.home() / "repos"
+
+
+def run_cmd(cmd: list[str], check: bool = True, capture: bool = False, **kwargs) -> subprocess.CompletedProcess:
+    """Run a command and optionally capture output."""
+    if capture:
+        kwargs.setdefault('capture_output', True)
+        kwargs.setdefault('text', True)
+    result = subprocess.run(cmd, **kwargs)
+    if check and result.returncode != 0:
+        if capture:
+            error(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
+        else:
+            error(f"Command failed: {' '.join(cmd)}")
+    return result
+
+
+def run_as_claude(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run a command as the claude user."""
+    return run_cmd(['sudo', '-u', 'claude'] + cmd, **kwargs)
+
+
+def path_exists_as_claude(path: Path) -> bool:
+    """Check if a path exists, running the check as the claude user."""
+    result = subprocess.run(
+        ['sudo', '-u', 'claude', 'test', '-e', str(path)],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+
+def is_git_repo_as_claude(path: Path) -> bool:
+    """Check if a path is a git repository, running the check as the claude user."""
+    result = subprocess.run(
+        ['sudo', '-u', 'claude', 'test', '-d', str(path / '.git')],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+
+def is_git_url(repo: str) -> bool:
+    """Check if the repo argument looks like a git URL."""
+    # HTTPS URLs
+    if repo.startswith(('https://', 'http://')):
+        return True
+    # SSH URLs (git@github.com:user/repo)
+    if re.match(r'^[\w-]+@[\w.-]+:[\w./-]+$', repo):
+        return True
+    # git:// protocol
+    if repo.startswith('git://'):
+        return True
+    return False
+
+
+def extract_repo_name(repo: str) -> str:
+    """Extract repository name from URL or path."""
+    # Remove .git suffix if present
+    repo = repo.rstrip('/')
+    if repo.endswith('.git'):
+        repo = repo[:-4]
+
+    # Handle URLs
+    if '://' in repo:
+        parsed = urlparse(repo)
+        path = parsed.path
+    elif ':' in repo:
+        # SSH URL format: git@github.com:user/repo
+        path = repo.split(':')[-1]
+    else:
+        path = repo
+
+    return Path(path).name
+
+
+def check_sudo_access() -> None:
+    """Verify we can sudo to the claude user."""
+    result = subprocess.run(
+        ['sudo', '-n', '-u', 'claude', 'true'],
+        capture_output=True
+    )
+    if result.returncode != 0:
+        error(
+            "Cannot sudo to claude user without password.\n"
+            "Have you run yoloclaude-setup? You may need to run:\n"
+            "  sudo yoloclaude-setup"
+        )
+
+
+def ensure_user_repo(repo_url: str, repos_dir: Path) -> Path:
+    """
+    Ensure the repo is cloned to the invoking user's repos directory.
+    Returns the path to the local clone.
+    """
+    repo_name = extract_repo_name(repo_url)
+    local_path = repos_dir / repo_name
+
+    if local_path.exists():
+        if not (local_path / '.git').exists():
+            error(f"{local_path} exists but is not a git repository")
+        info(f"Using existing local clone: {local_path}")
+
+        # Optionally fetch latest
+        if prompt_yes_no("Fetch latest changes from remote?"):
+            info("Fetching latest changes...")
+            run_cmd(['git', '-C', str(local_path), 'fetch', '--all'])
+    else:
+        # Create repos directory if needed
+        repos_dir.mkdir(parents=True, exist_ok=True)
+
+        info(f"Cloning {repo_url} to {local_path}...")
+        run_cmd(['git', 'clone', repo_url, str(local_path)])
+
+    return local_path
+
+
+def ensure_repo_accessible_to_claude(repo_path: Path) -> None:
+    """
+    Ensure the repository is readable AND writable by the claude user.
+    Readable so claude can clone from it, writable so claude can push to it.
+    This may require adjusting directory permissions along the path.
+    """
+    # Check if claude can access the repo
+    result = subprocess.run(
+        ['sudo', '-u', 'claude', 'test', '-r', str(repo_path)],
+        capture_output=True
+    )
+    needs_read_fix = result.returncode != 0
+
+    # Check if claude can write to the .git directory (needed for push)
+    git_dir = repo_path / '.git'
+    result = subprocess.run(
+        ['sudo', '-u', 'claude', 'test', '-w', str(git_dir)],
+        capture_output=True
+    )
+    needs_write_fix = result.returncode != 0
+
+    if not needs_read_fix and not needs_write_fix:
+        return  # Already accessible
+
+    if needs_read_fix:
+        warn(f"Repository at {repo_path} is not accessible to claude user.")
+        info("Making repository readable (chmod o+rx on repo and parent directories)...")
+
+        # Make each component of the path readable
+        # Start from the repo and work up to find the first accessible parent
+        path = repo_path
+        paths_to_fix = []
+        while path != path.parent:
+            result = subprocess.run(
+                ['sudo', '-u', 'claude', 'test', '-x', str(path)],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                break
+            paths_to_fix.append(path)
+            path = path.parent
+
+        # Fix permissions from top to bottom
+        for p in reversed(paths_to_fix):
+            run_cmd(['chmod', 'o+rx', str(p)])
+
+    # Make the repo readable
+    if git_dir.exists() and needs_read_fix:
+        run_cmd(['chmod', '-R', 'o+rX', str(git_dir)])
+
+    # Make the entire repo writable so claude can push and working tree can update
+    if needs_write_fix:
+        info("Making repository writable (needed for push)...")
+        run_cmd(['chmod', '-R', 'o+w', str(repo_path)])
+
+        # Configure repo to accept pushes to the current branch
+        # This updates the working tree after a push, which is what we want
+        info("Configuring repo to accept pushes (receive.denyCurrentBranch=updateInstead)...")
+        run_cmd(['git', '-C', str(repo_path), 'config', 'receive.denyCurrentBranch', 'updateInstead'])
+
+
+def ensure_claude_clone(origin_path: Path) -> Path:
+    """
+    Ensure the repo is cloned to claude's projects directory.
+    The clone's origin will point to origin_path (the invoking user's local repo).
+    Returns the path to claude's clone.
+    """
+    # First ensure claude can read the origin repo
+    ensure_repo_accessible_to_claude(origin_path)
+
+    claude_home = get_claude_home()
+    projects_dir = claude_home / "projects"
+    repo_name = origin_path.name
+    claude_repo_path = projects_dir / repo_name
+
+    if path_exists_as_claude(claude_repo_path):
+        if not is_git_repo_as_claude(claude_repo_path):
+            error(f"{claude_repo_path} exists but is not a git repository")
+
+        # Verify origin points to the right place
+        result = run_as_claude(
+            ['git', '-C', str(claude_repo_path), 'remote', 'get-url', 'origin'],
+            capture=True, check=False
+        )
+        current_origin = result.stdout.strip() if result.returncode == 0 else ""
+
+        if current_origin != str(origin_path):
+            warn(f"Claude's clone has different origin: {current_origin}")
+            if prompt_yes_no(f"Update origin to {origin_path}?"):
+                run_as_claude(['git', '-C', str(claude_repo_path), 'remote', 'set-url', 'origin', str(origin_path)])
+
+        info(f"Using existing claude clone: {claude_repo_path}")
+
+        # Fetch from origin
+        info("Fetching latest from local origin...")
+        run_as_claude(['git', '-C', str(claude_repo_path), 'fetch', 'origin'])
+
+        # Check if we should pull
+        result = run_as_claude(
+            ['git', '-C', str(claude_repo_path), 'status', '-uno'],
+            capture=True
+        )
+        if 'behind' in result.stdout:
+            if prompt_yes_no("Claude's clone is behind origin. Pull changes?"):
+                run_as_claude(['git', '-C', str(claude_repo_path), 'pull', '--ff-only'])
+    else:
+        info(f"Cloning {origin_path} to {claude_repo_path}...")
+        run_as_claude(['git', 'clone', str(origin_path), str(claude_repo_path)])
+
+    return claude_repo_path
+
+
+def run_claude_session(project_path: Path, claude_args: list[str]) -> int:
+    """
+    Run Claude Code as the claude user in the project directory.
+    Returns the exit code.
+    """
+    info(f"Starting Claude Code session in {project_path}")
+    info("Running as user: claude")
+    print()
+
+    # Build the command
+    # We use sudo -i to get a login shell environment, then cd and run claude
+    cmd = [
+        'sudo', '-u', 'claude', '-i',
+        'bash', '-c',
+        f'cd {project_path} && claude --dangerously-skip-permissions {" ".join(claude_args)}'
+    ]
+
+    # Run interactively (don't capture output)
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
+    """Handle git sync at end of session."""
+    print()
+    info("Session ended. Checking for changes...")
+
+    # Check for uncommitted changes
+    result = run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'status', '--porcelain'],
+        capture=True
+    )
+    if result.stdout.strip():
+        warn("There are uncommitted changes in Claude's working directory:")
+        run_as_claude(['git', '-C', str(claude_repo_path), 'status', '--short'])
+        print()
+
+    # Check for unpushed commits
+    result = run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'log', '--oneline', 'origin/HEAD..HEAD'],
+        capture=True, check=False
+    )
+
+    unpushed_commits = result.stdout.strip() if result.returncode == 0 else ""
+
+    if not unpushed_commits:
+        # Try with origin/main or origin/master
+        for branch in ['origin/main', 'origin/master']:
+            result = run_as_claude(
+                ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'{branch}..HEAD'],
+                capture=True, check=False
+            )
+            if result.returncode == 0:
+                unpushed_commits = result.stdout.strip()
+                break
+
+    if unpushed_commits:
+        print()
+        info("Unpushed commits:")
+        print(unpushed_commits)
+        print()
+
+        if prompt_yes_no("Push these commits to your local repo?"):
+            info(f"Pushing to {origin_path}...")
+            run_as_claude(['git', '-C', str(claude_repo_path), 'push', 'origin', 'HEAD'])
+            info("Changes pushed to your local repo.")
+
+            # Check if local repo has a remote
+            result = run_cmd(
+                ['git', '-C', str(origin_path), 'remote', 'get-url', 'origin'],
+                capture=True, check=False
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                print()
+                if prompt_yes_no("Push from your local repo to remote?"):
+                    run_cmd(['git', '-C', str(origin_path), 'push'])
+                    info("Changes pushed to remote!")
+    else:
+        info("No unpushed commits.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Run Claude Code in a sandboxed user environment',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  yoloclaude https://github.com/user/repo
+  yoloclaude /path/to/local/repo
+  yoloclaude myproject                      # if already cloned to ~/repos/myproject
+  yoloclaude https://github.com/user/repo --print  # pass flags to claude
+        """
+    )
+    parser.add_argument(
+        'repo',
+        help='Git repository URL, local path, or project name'
+    )
+    parser.add_argument(
+        'claude_args',
+        nargs='*',
+        help='Additional arguments to pass to claude'
+    )
+    parser.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        help='Non-interactive mode: answer yes to all prompts'
+    )
+
+    args = parser.parse_args()
+
+    # Set global auto-yes flag
+    global AUTO_YES
+    AUTO_YES = args.yes
+
+    # Check prerequisites
+    check_sudo_access()
+
+    claude_home = get_claude_home()
+    if not claude_home.exists():
+        error(
+            f"Claude home directory {claude_home} does not exist.\n"
+            "Have you run yoloclaude-setup?"
+        )
+
+    repos_dir = get_user_repos_dir()
+
+    # Determine the origin path (invoking user's local repo)
+    repo = args.repo
+
+    if is_git_url(repo):
+        # Remote URL - clone to user's repos dir first
+        origin_path = ensure_user_repo(repo, repos_dir)
+    elif os.path.isdir(repo):
+        # Local directory path
+        origin_path = Path(repo).resolve()
+        if not (origin_path / '.git').exists():
+            error(f"{origin_path} is not a git repository")
+    elif os.path.isdir(repos_dir / repo):
+        # Project name that exists in repos dir
+        origin_path = repos_dir / repo
+        if not (origin_path / '.git').exists():
+            error(f"{origin_path} is not a git repository")
+    else:
+        error(
+            f"Cannot find repository: {repo}\n"
+            "Provide a git URL, local path, or existing project name in ~/repos/"
+        )
+
+    info(f"Origin (your local repo): {origin_path}")
+
+    # Ensure claude has a clone
+    claude_repo_path = ensure_claude_clone(origin_path)
+
+    # Run Claude Code
+    exit_code = run_claude_session(claude_repo_path, args.claude_args)
+
+    # Handle end of session
+    handle_end_of_session(claude_repo_path, origin_path)
+
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()

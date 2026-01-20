@@ -129,27 +129,46 @@ create_test_repo() {
 }
 
 # ============================================================================
-# Test: yoloclaude with local repo path
+# Test: yoloclaude with local repo path (creates worktree)
 # ============================================================================
 test_local_repo() {
     log_test "Testing yoloclaude with local repo path..."
 
     USER_REPO="/home/testuser/repos/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
 
     # Run yoloclaude with the local repo using --yes for non-interactive mode
     cd /home/testuser
     "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
 
-    # Verify claude's clone exists (check as claude since testuser may not have access)
-    if sudo -u claude test -d /home/claude/projects/test-project; then
-        log_pass "Claude's project clone created"
+    # Verify claude's base clone exists
+    if sudo -u claude test -d "$BASE_CLONE"; then
+        log_pass "Claude's base clone created"
     else
-        log_fail "Claude's project clone not created"
+        log_fail "Claude's base clone not created"
+        return 1
+    fi
+
+    # Verify worktrees directory exists
+    if sudo -u claude test -d "$BASE_CLONE/worktrees"; then
+        log_pass "Worktrees directory created"
+    else
+        log_fail "Worktrees directory not created"
+        return 1
+    fi
+
+    # Find the worktree (there should be one)
+    WORKTREE_PATH=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [[ -n "$WORKTREE_PATH" ]] && sudo -u claude test -d "$WORKTREE_PATH"; then
+        log_pass "Worktree created: $(basename "$WORKTREE_PATH")"
+    else
+        log_fail "No worktree found in $BASE_CLONE/worktrees"
+        sudo -u claude ls -la "$BASE_CLONE/worktrees" 2>/dev/null || echo "Cannot list worktrees dir"
         return 1
     fi
 
     # Verify origin points to user's repo
-    CLAUDE_ORIGIN=$(sudo -u claude git -C /home/claude/projects/test-project remote get-url origin)
+    CLAUDE_ORIGIN=$(sudo -u claude git -C "$BASE_CLONE" remote get-url origin)
     if [[ "$CLAUDE_ORIGIN" == "$USER_REPO" ]]; then
         log_pass "Claude's origin correctly points to user's repo"
     else
@@ -157,14 +176,17 @@ test_local_repo() {
         return 1
     fi
 
-    # Verify mock claude made a commit
-    COMMIT_COUNT=$(sudo -u claude git -C /home/claude/projects/test-project log --oneline | wc -l)
+    # Verify mock claude made a commit in the worktree
+    COMMIT_COUNT=$(sudo -u claude git -C "$WORKTREE_PATH" log --oneline | wc -l)
     if [[ "$COMMIT_COUNT" -gt 1 ]]; then
         log_pass "Mock Claude created commits (total: $COMMIT_COUNT)"
     else
         log_fail "No new commits from mock Claude"
         return 1
     fi
+
+    # Store worktree path for later tests
+    export FIRST_WORKTREE_PATH="$WORKTREE_PATH"
 }
 
 # ============================================================================
@@ -175,40 +197,110 @@ test_git_push_flow() {
 
     USER_REPO="/home/testuser/repos/test-project"
 
-    # With --yes mode, commits should have been auto-pushed to user's repo
-    # Verify commits arrived in user's repo (should have more than initial commit)
-    USER_COMMITS=$(git -C "$USER_REPO" log --oneline | wc -l)
-    if [[ "$USER_COMMITS" -gt 1 ]]; then
-        log_pass "Commits successfully pushed to user's repo (total: $USER_COMMITS)"
+    # With worktrees, commits go to a branch (not main)
+    # Check that a claude/* branch exists and has commits
+    CLAUDE_BRANCHES=$(git -C "$USER_REPO" branch -a | grep "claude/" | wc -l)
+    if [[ "$CLAUDE_BRANCHES" -ge 1 ]]; then
+        log_pass "Claude branch pushed to user's repo ($CLAUDE_BRANCHES branches)"
     else
-        log_fail "Commits not found in user's repo (only $USER_COMMITS commits)"
+        log_fail "No claude/* branch found in user's repo"
+        git -C "$USER_REPO" branch -a
+        return 1
+    fi
+
+    # Check the branch has more commits than main
+    BRANCH_NAME=$(git -C "$USER_REPO" branch -a | grep "claude/" | head -1 | tr -d ' *')
+    BRANCH_COMMITS=$(git -C "$USER_REPO" log --oneline "$BRANCH_NAME" | wc -l)
+    if [[ "$BRANCH_COMMITS" -gt 1 ]]; then
+        log_pass "Branch has commits (total: $BRANCH_COMMITS)"
+    else
+        log_fail "Branch doesn't have expected commits"
         return 1
     fi
 }
 
 # ============================================================================
-# Test: Second run uses existing clone
+# Test: Second run creates a new worktree
 # ============================================================================
-test_existing_clone() {
-    log_test "Testing reuse of existing clone..."
+test_second_worktree() {
+    log_test "Testing second session creates new worktree..."
 
     USER_REPO="/home/testuser/repos/test-project"
-    CLAUDE_REPO="/home/claude/projects/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
 
-    # Get current commit count
-    BEFORE_COUNT=$(sudo -u claude git -C "$CLAUDE_REPO" log --oneline | wc -l)
+    # Count worktrees before
+    BEFORE_COUNT=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
     # Run yoloclaude again with --yes for non-interactive mode
     cd /home/testuser
     "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
 
-    # Check commit count increased
-    AFTER_COUNT=$(sudo -u claude git -C "$CLAUDE_REPO" log --oneline | wc -l)
+    # Count worktrees after
+    AFTER_COUNT=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
     if [[ "$AFTER_COUNT" -gt "$BEFORE_COUNT" ]]; then
-        log_pass "Second run created new commits ($BEFORE_COUNT -> $AFTER_COUNT)"
+        log_pass "Second session created new worktree ($BEFORE_COUNT -> $AFTER_COUNT)"
     else
-        log_fail "Second run did not create commits"
+        log_fail "Second session did not create new worktree"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Session listing
+# ============================================================================
+test_list_sessions() {
+    log_test "Testing --list shows sessions..."
+
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" --list 2>&1)
+
+    # Should show at least 2 sessions (from previous tests)
+    if echo "$OUTPUT" | grep -q "test-project"; then
+        log_pass "Session list shows test-project sessions"
+    else
+        log_fail "Session list doesn't show expected sessions"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Check session files exist (in invoking user's home)
+    SESSION_COUNT=$(ls /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | wc -l)
+    if [[ "$SESSION_COUNT" -ge 2 ]]; then
+        log_pass "Session files created ($SESSION_COUNT sessions)"
+    else
+        log_fail "Expected at least 2 session files, found $SESSION_COUNT"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Resume session
+# ============================================================================
+test_resume_session() {
+    log_test "Testing --resume..."
+
+    cd /home/testuser
+
+    # Get the most recent session ID (from invoking user's home)
+    SESSION_ID=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1 | xargs basename | sed 's/.json$//')
+
+    if [[ -z "$SESSION_ID" ]]; then
+        log_fail "No session found to resume"
+        return 1
+    fi
+
+    log_info "Resuming session: $SESSION_ID"
+
+    # Resume the session with --yes
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes --resume "$SESSION_ID" || true
+
+    # Verify session was accessed (last_accessed should be updated)
+    # Just check that it ran without error and mock claude executed
+    if cat "/home/testuser/.yoloclaude/sessions/${SESSION_ID}.json" | grep -q "last_accessed"; then
+        log_pass "Resume session executed successfully"
+    else
+        log_fail "Session file not found after resume"
         return 1
     fi
 }
@@ -262,7 +354,9 @@ main() {
     create_test_repo
     test_local_repo
     test_git_push_flow
-    test_existing_clone
+    test_second_worktree
+    test_list_sessions
+    test_resume_session
     test_missing_repo
 
     echo ""

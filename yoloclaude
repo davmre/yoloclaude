@@ -8,11 +8,15 @@ freedom to install packages and modify files within its own environment.
 """
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 
@@ -107,6 +111,132 @@ def is_git_repo_as_claude(path: Path) -> bool:
         capture_output=True
     )
     return result.returncode == 0
+
+
+# =============================================================================
+# Session Management
+# =============================================================================
+
+class Session:
+    """Represents a yoloclaude session with its associated worktree."""
+
+    def __init__(
+        self,
+        session_id: str,
+        project_name: str,
+        branch: str,
+        worktree_path: str,
+        origin_path: str,
+        created_at: str,
+        last_accessed: str,
+        claude_session_id: Optional[str] = None,
+        status: str = "active"
+    ):
+        self.session_id = session_id
+        self.project_name = project_name
+        self.branch = branch
+        self.worktree_path = worktree_path
+        self.origin_path = origin_path
+        self.created_at = created_at
+        self.last_accessed = last_accessed
+        self.claude_session_id = claude_session_id
+        self.status = status
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "project_name": self.project_name,
+            "branch": self.branch,
+            "worktree_path": self.worktree_path,
+            "origin_path": self.origin_path,
+            "created_at": self.created_at,
+            "last_accessed": self.last_accessed,
+            "claude_session_id": self.claude_session_id,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'Session':
+        return cls(**data)
+
+    def save(self) -> None:
+        """Save session to disk."""
+        sessions_dir = get_sessions_dir()
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        session_file = sessions_dir / f"{self.session_id}.json"
+        with open(session_file, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, session_id: str) -> Optional['Session']:
+        """Load a session from disk."""
+        session_file = get_sessions_dir() / f"{session_id}.json"
+        if not session_file.exists():
+            return None
+        with open(session_file) as f:
+            return cls.from_dict(json.load(f))
+
+
+def get_sessions_dir() -> Path:
+    """Get the directory where sessions are stored (in invoking user's home)."""
+    return Path.home() / ".yoloclaude" / "sessions"
+
+
+def generate_session_id() -> str:
+    """Generate a short unique session ID."""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    hash_suffix = hashlib.sha256(str(datetime.now().timestamp()).encode()).hexdigest()[:6]
+    return f"{timestamp}-{hash_suffix}"
+
+
+def generate_branch_name(project_name: str) -> str:
+    """Generate a default branch name for a new session."""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    hash_suffix = hashlib.sha256(str(datetime.now().timestamp()).encode()).hexdigest()[:4]
+    return f"claude/{project_name}-{timestamp}-{hash_suffix}"
+
+
+def list_sessions(project_filter: Optional[str] = None) -> list[Session]:
+    """List all sessions, optionally filtered by project name."""
+    sessions_dir = get_sessions_dir()
+    if not sessions_dir.exists():
+        return []
+
+    sessions = []
+    for session_file in sessions_dir.glob("*.json"):
+        try:
+            with open(session_file) as f:
+                session = Session.from_dict(json.load(f))
+                if project_filter is None or session.project_name == project_filter:
+                    sessions.append(session)
+        except (json.JSONDecodeError, KeyError):
+            warn(f"Skipping corrupted session file: {session_file}")
+
+    # Sort by last_accessed, most recent first
+    sessions.sort(key=lambda s: s.last_accessed, reverse=True)
+    return sessions
+
+
+def find_session(session_id_prefix: str) -> Optional[Session]:
+    """Find a session by ID or prefix."""
+    sessions_dir = get_sessions_dir()
+    if not sessions_dir.exists():
+        return None
+
+    # Try exact match first
+    exact_match = sessions_dir / f"{session_id_prefix}.json"
+    if exact_match.exists():
+        return Session.load(session_id_prefix)
+
+    # Try prefix match
+    matches = list(sessions_dir.glob(f"{session_id_prefix}*.json"))
+    if len(matches) == 1:
+        session_id = matches[0].stem
+        return Session.load(session_id)
+    elif len(matches) > 1:
+        error(f"Ambiguous session ID prefix '{session_id_prefix}'. Matches: {[m.stem for m in matches]}")
+
+    return None
 
 
 def is_git_url(repo: str) -> bool:
@@ -296,7 +426,162 @@ def ensure_claude_clone(origin_path: Path) -> Path:
     return claude_repo_path
 
 
-def run_claude_session(project_path: Path, claude_args: list[str]) -> int:
+def create_worktree(base_repo: Path, origin_path: Path, branch_name: str) -> Path:
+    """
+    Create a git worktree for a new session.
+    Returns the path to the worktree.
+    """
+    worktrees_dir = base_repo / "worktrees"
+    worktree_path = worktrees_dir / branch_name.replace('/', '-')
+
+    # Create worktrees directory if needed
+    run_as_claude(['mkdir', '-p', str(worktrees_dir)])
+
+    # Fetch latest from origin first
+    info("Fetching latest from origin...")
+    run_as_claude(['git', '-C', str(base_repo), 'fetch', 'origin'])
+
+    # Get the default branch from origin
+    result = run_as_claude(
+        ['git', '-C', str(base_repo), 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+        capture=True, check=False
+    )
+    if result.returncode == 0:
+        default_branch = result.stdout.strip().split('/')[-1]
+    else:
+        # Fallback to main or master
+        default_branch = 'main'
+
+    # Create the worktree with a new branch based on origin's default
+    info(f"Creating worktree for branch '{branch_name}'...")
+    run_as_claude([
+        'git', '-C', str(base_repo),
+        'worktree', 'add',
+        '-b', branch_name,
+        str(worktree_path),
+        f'origin/{default_branch}'
+    ])
+
+    return worktree_path
+
+
+def prompt_branch_name(project_name: str) -> str:
+    """Prompt for a branch name with an auto-generated default."""
+    default_name = generate_branch_name(project_name)
+
+    if AUTO_YES:
+        info(f"Using branch: {default_name} [auto]")
+        return default_name
+
+    print()
+    info(f"Default branch name: {default_name}")
+    custom_name = prompt("Branch name (press Enter for default)")
+
+    if custom_name.strip():
+        # Ensure branch name has claude/ prefix for clarity
+        if not custom_name.startswith('claude/'):
+            custom_name = f"claude/{custom_name}"
+        return custom_name
+    return default_name
+
+
+def start_new_session(origin_path: Path, claude_args: list[str]) -> tuple[Session, int]:
+    """
+    Start a new yoloclaude session with a fresh worktree.
+    Returns the session and the exit code from Claude.
+    """
+    project_name = origin_path.name
+
+    # Ensure base clone exists
+    base_repo = ensure_claude_clone(origin_path)
+
+    # Get branch name from user
+    branch_name = prompt_branch_name(project_name)
+
+    # Create worktree
+    worktree_path = create_worktree(base_repo, origin_path, branch_name)
+
+    # Create session record
+    session_id = generate_session_id()
+    now = datetime.now().isoformat()
+    session = Session(
+        session_id=session_id,
+        project_name=project_name,
+        branch=branch_name,
+        worktree_path=str(worktree_path),
+        origin_path=str(origin_path),
+        created_at=now,
+        last_accessed=now,
+        status="active"
+    )
+    session.save()
+
+    info(f"Session ID: {session_id}")
+
+    # Run Claude Code
+    exit_code = run_claude_session(worktree_path, claude_args, session)
+
+    # Handle end of session
+    handle_end_of_session(worktree_path, origin_path)
+
+    return session, exit_code
+
+
+def resume_session(session: Session, claude_args: list[str]) -> int:
+    """
+    Resume an existing session.
+    Returns the exit code from Claude.
+    """
+    worktree_path = Path(session.worktree_path)
+    origin_path = Path(session.origin_path)
+
+    # Verify worktree still exists
+    if not path_exists_as_claude(worktree_path):
+        error(f"Worktree no longer exists: {worktree_path}")
+
+    # Ensure origin is still accessible
+    ensure_repo_accessible_to_claude(origin_path)
+
+    # Update last accessed
+    session.last_accessed = datetime.now().isoformat()
+    session.save()
+
+    info(f"Resuming session: {session.session_id}")
+    info(f"Project: {session.project_name}")
+    info(f"Branch: {session.branch}")
+
+    # Run Claude Code with --resume if we have a claude session ID
+    if session.claude_session_id:
+        claude_args = ['--resume', session.claude_session_id] + list(claude_args)
+
+    exit_code = run_claude_session(worktree_path, claude_args, session)
+
+    # Handle end of session
+    handle_end_of_session(worktree_path, origin_path)
+
+    return exit_code
+
+
+def display_sessions(sessions: list[Session]) -> None:
+    """Display a list of sessions in a table format."""
+    if not sessions:
+        info("No sessions found.")
+        return
+
+    print()
+    print(f"{'ID':<20} {'Project':<20} {'Branch':<35} {'Last Accessed':<20}")
+    print("-" * 95)
+    for s in sessions:
+        # Truncate long values
+        session_id = s.session_id[:18] + ".." if len(s.session_id) > 20 else s.session_id
+        project = s.project_name[:18] + ".." if len(s.project_name) > 20 else s.project_name
+        branch = s.branch[:33] + ".." if len(s.branch) > 35 else s.branch
+        last_accessed = s.last_accessed[:19]  # Just the datetime part
+        print(f"{session_id:<20} {project:<20} {branch:<35} {last_accessed:<20}")
+    print()
+
+
+def run_claude_session(project_path: Path, claude_args: list[str], session: Optional[Session] = None) -> int:
     """
     Run Claude Code as the claude user in the project directory.
     Returns the exit code.
@@ -383,14 +668,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  yoloclaude https://github.com/user/repo
-  yoloclaude /path/to/local/repo
-  yoloclaude myproject                      # if already cloned to ~/repos/myproject
-  yoloclaude https://github.com/user/repo --print  # pass flags to claude
+  yoloclaude https://github.com/user/repo     # Start new session with remote repo
+  yoloclaude /path/to/local/repo              # Start new session with local repo
+  yoloclaude myproject                        # Start new session (repo in ~/repos/)
+  yoloclaude --resume                         # List sessions and pick one to resume
+  yoloclaude --resume abc123                  # Resume session by ID
+  yoloclaude --list                           # List all sessions
         """
     )
     parser.add_argument(
         'repo',
+        nargs='?',
         help='Git repository URL, local path, or project name'
     )
     parser.add_argument(
@@ -402,6 +690,18 @@ Examples:
         '-y', '--yes',
         action='store_true',
         help='Non-interactive mode: answer yes to all prompts'
+    )
+    parser.add_argument(
+        '-r', '--resume',
+        nargs='?',
+        const='__list__',
+        metavar='SESSION_ID',
+        help='Resume a previous session (shows list if no ID given)'
+    )
+    parser.add_argument(
+        '-l', '--list',
+        action='store_true',
+        help='List all sessions'
     )
 
     args = parser.parse_args()
@@ -419,6 +719,49 @@ Examples:
             f"Claude home directory {claude_home} does not exist.\n"
             "Have you run yoloclaude-setup?"
         )
+
+    # Handle --list
+    if args.list:
+        sessions = list_sessions()
+        display_sessions(sessions)
+        sys.exit(0)
+
+    # Handle --resume
+    if args.resume is not None:
+        if args.resume == '__list__':
+            # Show list and let user pick
+            sessions = list_sessions()
+            if not sessions:
+                error("No sessions to resume. Start a new session first.")
+
+            display_sessions(sessions)
+
+            if AUTO_YES:
+                # In auto mode, resume the most recent session
+                session = sessions[0]
+                info(f"Auto-resuming most recent session: {session.session_id}")
+            else:
+                session_id = prompt("Enter session ID to resume (or press Enter for most recent)")
+                if session_id.strip():
+                    session = find_session(session_id.strip())
+                    if not session:
+                        error(f"Session not found: {session_id}")
+                else:
+                    session = sessions[0]
+        else:
+            # Resume specific session
+            session = find_session(args.resume)
+            if not session:
+                error(f"Session not found: {args.resume}")
+
+        exit_code = resume_session(session, args.claude_args)
+        sys.exit(exit_code)
+
+    # New session - need a repo
+    if not args.repo:
+        parser.print_help()
+        print()
+        error("Please provide a repository, or use --resume to continue a previous session.")
 
     repos_dir = get_user_repos_dir()
 
@@ -446,14 +789,8 @@ Examples:
 
     info(f"Origin (your local repo): {origin_path}")
 
-    # Ensure claude has a clone
-    claude_repo_path = ensure_claude_clone(origin_path)
-
-    # Run Claude Code
-    exit_code = run_claude_session(claude_repo_path, args.claude_args)
-
-    # Handle end of session
-    handle_end_of_session(claude_repo_path, origin_path)
+    # Start new session with worktree
+    session, exit_code = start_new_session(origin_path, args.claude_args)
 
     sys.exit(exit_code)
 

@@ -288,35 +288,28 @@ setup_claude_md() {
     cat << 'CLAUDE_MD_EOF' | sudo -H -u claude tee "$claude_md_path" > /dev/null
 # yoloclaude Sandbox Environment
 
-You are running inside a **yoloclaude sandbox**. This provides isolation
-between you and the invoking user's environment.
+This session is managed by `yoloclaude`, a tool to create sandboxed environents where software agents can safely work.
 
 ## Key Points
 
-**Git origin is local, not remote:**
-- Your git `origin` points to the invoking user's local repo, not GitHub/GitLab
-- This is intentional for sandbox isolation
-
-**Do NOT try to push:**
-- You cannot push directly (permission denied is expected)
-- **yoloclaude handles syncing** when the session ends
-- Just commit your changes normally - sync happens automatically
-
 **You are the `claude` user:**
 - Isolated Unix user with its own home directory
-- You're working in a git worktree under ~/projects/<project>/worktrees/
+- Unix permissions prevent accidental damage to system or other user files
+- You're working in a git worktree under `~/projects/<project>/worktrees/`
 - Each session gets its own worktree branch
+- It is safe to make whatever changes you like within this worktree
 
-## Workflow
+**Environment setup**:
+- If you need to install any tools, do so at the user level (eg under `~/local/bin`)
+- For Python projects with dependencies, please use `uv` to access a project-specific virtualenv under `~/projects/<project>/.venv/` (create this if needed)
+- You cannot use `sudo` or make system-level changes directly; if necessary, ask the user to run any such commands themselves
 
-1. Make changes and commit them normally
-2. When the session ends, yoloclaude will:
-   - Sync your commits to the invoking user's repo
-   - Offer to merge into their branch
-   - Offer to push to the remote
-
-If you see "permission denied" on push, this is expected - just let the
-session end and yoloclaude will handle it.
+**Git origin is local, not remote:**
+- Your git `origin` points to a local repo owned by the invoking user (not GitHub/GitLab)
+- This is intentional for sandbox isolation
+- You cannot push directly (permission denied is expected)
+- **yoloclaude handles syncing** when the session ends. No need to push.
+- Just commit changes normally - sync happens automatically.
 CLAUDE_MD_EOF
 
     info "Created $claude_md_path"

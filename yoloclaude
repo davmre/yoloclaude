@@ -1056,6 +1056,13 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
         run_as_claude(['git', '-C', str(claude_repo_path), 'status', '--short'])
         print()
 
+    # Fetch from origin to get accurate view of what's already synced
+    # (origin points to the invoking user's repo)
+    run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'fetch', 'origin'],
+        check=False, capture=True
+    )
+
     # Check for unpushed commits
     result = run_as_claude(
         ['git', '-C', str(claude_repo_path), 'log', '--oneline', 'origin/HEAD..HEAD'],

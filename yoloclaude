@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -221,44 +222,22 @@ def is_git_repo_as_claude(path: Path) -> bool:
 # Session Management
 # =============================================================================
 
+@dataclass
 class Session:
     """Represents a yoloclaude session with its associated worktree."""
 
-    def __init__(
-        self,
-        session_id: str,
-        project_name: str,
-        branch: str,
-        worktree_path: str,
-        origin_path: str,
-        created_at: str,
-        last_accessed: str,
-        claude_session_id: Optional[str] = None,
-        source_branch: str = "main",
-    ):
-        self.session_id = session_id
-        self.project_name = project_name
-        self.branch = branch
-        self.worktree_path = worktree_path
-        self.origin_path = origin_path
-        self.created_at = created_at
-        self.last_accessed = last_accessed
-        # TODO: Populate this from Claude's output to enable --resume
-        self.claude_session_id = claude_session_id
-        self.source_branch = source_branch
+    session_id: str
+    project_name: str
+    branch: str
+    worktree_path: str
+    origin_path: str
+    created_at: str
+    last_accessed: str
+    claude_session_id: Optional[str] = None
+    source_branch: str = "main"
 
     def to_dict(self) -> dict:
-        return {
-            "session_id": self.session_id,
-            "project_name": self.project_name,
-            "branch": self.branch,
-            "worktree_path": self.worktree_path,
-            "origin_path": self.origin_path,
-            "created_at": self.created_at,
-            "last_accessed": self.last_accessed,
-            "claude_session_id": self.claude_session_id,
-            "source_branch": self.source_branch,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Session':
@@ -304,6 +283,31 @@ def generate_branch_name(project_name: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     hash_suffix = hashlib.sha256(str(datetime.now().timestamp()).encode()).hexdigest()[:4]
     return f"claude/{project_name}-{timestamp}-{hash_suffix}"
+
+
+def create_session(
+    project_name: str,
+    branch: str,
+    worktree_path: Path,
+    origin_path: Path,
+    source_branch: str,
+    claude_session_id: Optional[str] = None,
+) -> Session:
+    """Create and save a new session."""
+    now = datetime.now().isoformat()
+    session = Session(
+        session_id=generate_session_id(),
+        project_name=project_name,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        origin_path=str(origin_path),
+        created_at=now,
+        last_accessed=now,
+        claude_session_id=claude_session_id,
+        source_branch=source_branch,
+    )
+    session.save()
+    return session
 
 
 def list_sessions(project_filter: Optional[str] = None) -> list[Session]:
@@ -938,21 +942,15 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
     worktree_path = create_worktree(base_repo, origin_path, branch_name, source_branch)
 
     # Create session record
-    session_id = generate_session_id()
-    now = datetime.now().isoformat()
-    session = Session(
-        session_id=session_id,
+    session = create_session(
         project_name=project_name,
         branch=branch_name,
-        worktree_path=str(worktree_path),
-        origin_path=str(origin_path),
-        created_at=now,
-        last_accessed=now,
+        worktree_path=worktree_path,
+        origin_path=origin_path,
         source_branch=source_branch,
     )
-    session.save()
 
-    info(f"Session ID: {session_id}")
+    info(f"Session ID: {session.session_id}")
 
     # Run Claude Code or shell
     if shell_mode:
@@ -1194,6 +1192,81 @@ def run_shell_session(project_path: Path) -> int:
     return result.returncode
 
 
+def _sync_commits_via_bundle(claude_repo_path: Path, origin_path: Path, branch: str) -> None:
+    """
+    Sync commits from claude's worktree to origin using a git bundle.
+
+    We use a bundle because direct fetch fails due to git's "dubious ownership"
+    check - the -c safe.directory option doesn't propagate to the git-upload-pack
+    subprocess that runs in the worktree.
+
+    The bundle is created in /tmp (world-accessible) rather than inside the
+    worktree, because the invoking user may not have traverse permission
+    through /home/claude.
+    """
+    bundle_path = f'/tmp/yoloclaude-sync-{os.getpid()}-{branch.replace("/", "-")}.bundle'
+    try:
+        info(f"Syncing changes to {origin_path}...")
+        # Create bundle as claude (who owns the worktree)
+        run_as_claude([
+            'git', '-C', str(claude_repo_path),
+            'bundle', 'create', bundle_path, branch
+        ])
+        # Make bundle readable by invoking user (in case umask restricted it)
+        run_as_claude(['chmod', '644', bundle_path])
+        # Fetch from bundle as invoking user (who owns origin)
+        run_cmd([
+            'git', '-C', str(origin_path),
+            'fetch', bundle_path, f'{branch}:{branch}'
+        ])
+    finally:
+        # Clean up bundle (as claude since claude owns it)
+        run_as_claude(['rm', '-f', bundle_path], check=False)
+    info("Changes synced to your local repo.")
+
+
+def _offer_merge_to_source(origin_path: Path, branch: str, source_branch: str) -> None:
+    """Offer to merge the worktree branch into the source branch if possible."""
+    current_in_origin = get_origin_current_branch(origin_path)
+
+    if current_in_origin == source_branch:
+        # Source branch is checked out - can offer merge
+        ff_check = run_cmd(
+            ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', source_branch, branch],
+            check=False, capture=True
+        )
+        print()
+        if ff_check.returncode == 0:
+            if prompt_yes_no(f"Merge '{branch}' into '{source_branch}'? (fast-forward)"):
+                run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
+                info(f"Merged into {source_branch}.")
+        else:
+            info(f"Branch '{branch}' can't be fast-forwarded into '{source_branch}'.")
+            info(f"To merge manually: git checkout {source_branch} && git merge {branch}")
+    else:
+        info(f"Source branch '{source_branch}' is not checked out in origin.")
+        info(f"To merge: git checkout {source_branch} && git merge {branch}")
+
+
+def _offer_push_to_remote(origin_path: Path) -> None:
+    """Offer to push to remote if one exists."""
+    result = run_cmd(
+        ['git', '-C', str(origin_path), 'remote', 'get-url', 'origin'],
+        capture=True, check=False
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        print()
+        if prompt_yes_no("Push to remote?"):
+            current_branch_result = run_cmd(
+                ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture=True, check=False
+            )
+            if current_branch_result.returncode == 0:
+                push_branch = current_branch_result.stdout.strip()
+                run_cmd(['git', '-C', str(origin_path), 'push', 'origin', push_branch])
+                info(f"Pushed {push_branch} to remote!")
+
+
 def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Session) -> None:
     """Handle git sync at end of session."""
     print()
@@ -1212,7 +1285,6 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Se
         print()
 
     # Fetch from origin to get accurate view of what's already synced
-    # (origin points to the invoking user's repo)
     run_as_claude(
         ['git', '-C', str(claude_repo_path), 'fetch', 'origin'],
         check=False, capture=True
@@ -1223,93 +1295,30 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Se
         ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'origin/{source_branch}..HEAD'],
         capture=True, check=False
     )
-
     unpushed_commits = result.stdout.strip() if result.returncode == 0 else ""
 
-    if unpushed_commits:
-        print()
-        info("Unpushed commits:")
-        print(unpushed_commits)
-        print()
-
-        if prompt_yes_no("Sync these commits to your local repo?"):
-            # Get the current branch name from the worktree
-            branch_result = run_as_claude(
-                ['git', '-C', str(claude_repo_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
-                capture=True
-            )
-            branch = branch_result.stdout.strip()
-
-            # Fetch from worktree into origin using a bundle as intermediary
-            # This keeps the origin read-only to claude for sandbox isolation
-            # We use a bundle because direct fetch fails due to git's "dubious
-            # ownership" check - the -c safe.directory option doesn't propagate
-            # to the git-upload-pack subprocess that runs in the worktree
-            #
-            # Create the bundle in /tmp (world-accessible) rather than inside
-            # the worktree, because the invoking user may not have traverse
-            # permission through /home/claude. We let claude create the file
-            # (claude can write to /tmp which has 1777 permissions).
-            bundle_path = f'/tmp/yoloclaude-sync-{os.getpid()}-{branch.replace("/", "-")}.bundle'
-            try:
-                # Create bundle as claude (who owns the worktree)
-                info(f"Syncing changes to {origin_path}...")
-                run_as_claude([
-                    'git', '-C', str(claude_repo_path),
-                    'bundle', 'create', bundle_path, branch
-                ])
-                # Make bundle readable by invoking user (in case umask restricted it)
-                run_as_claude(['chmod', '644', bundle_path])
-                # Fetch from bundle as invoking user (who owns origin)
-                run_cmd([
-                    'git', '-C', str(origin_path),
-                    'fetch', bundle_path, f'{branch}:{branch}'
-                ])
-            finally:
-                # Clean up bundle (as claude since claude owns it)
-                run_as_claude(['rm', '-f', bundle_path], check=False)
-            info("Changes synced to your local repo.")
-
-            # Check if source branch is checked out in origin - offer merge
-            current_in_origin = get_origin_current_branch(origin_path)
-
-            if current_in_origin == source_branch:
-                # Source branch is checked out - can offer merge
-                ff_check = run_cmd(
-                    ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', source_branch, branch],
-                    check=False, capture=True
-                )
-                print()
-                if ff_check.returncode == 0:
-                    if prompt_yes_no(f"Merge '{branch}' into '{source_branch}'? (fast-forward)"):
-                        run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
-                        info(f"Merged into {source_branch}.")
-                else:
-                    info(f"Branch '{branch}' can't be fast-forwarded into '{source_branch}'.")
-                    info(f"To merge manually: git checkout {source_branch} && git merge {branch}")
-            else:
-                info(f"Source branch '{source_branch}' is not checked out in origin.")
-                info(f"To merge: git checkout {source_branch} && git merge {branch}")
-
-            # Check if local repo has a remote
-            result = run_cmd(
-                ['git', '-C', str(origin_path), 'remote', 'get-url', 'origin'],
-                capture=True, check=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                print()
-                if prompt_yes_no("Push to remote?"):
-                    # Push whatever branch is currently checked out
-                    current_branch_result = run_cmd(
-                        ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
-                        capture=True, check=False
-                    )
-                    if current_branch_result.returncode == 0:
-                        push_branch = current_branch_result.stdout.strip()
-                        run_cmd(['git', '-C', str(origin_path), 'push', 'origin', push_branch])
-                        info(f"Pushed {push_branch} to remote!")
-    else:
+    if not unpushed_commits:
         info("No unpushed commits.")
+        return
+
+    print()
+    info("Unpushed commits:")
+    print(unpushed_commits)
+    print()
+
+    if not prompt_yes_no("Sync these commits to your local repo?"):
+        return
+
+    # Get the current branch name from the worktree
+    branch_result = run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+        capture=True
+    )
+    branch = branch_result.stdout.strip()
+
+    _sync_commits_via_bundle(claude_repo_path, origin_path, branch)
+    _offer_merge_to_source(origin_path, branch, source_branch)
+    _offer_push_to_remote(origin_path)
 
 
 # =============================================================================
@@ -1538,41 +1547,25 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
 
     if not imported_uuid:
         warn("Session import failed. Starting fresh session.")
-        # Fall back to normal new session behavior
-        session_id = generate_session_id()
-        now = datetime.now().isoformat()
-        session = Session(
-            session_id=session_id,
+        session = create_session(
             project_name=project_name,
             branch=branch_name,
-            worktree_path=str(worktree_path),
-            origin_path=str(origin_path),
-            created_at=now,
-            last_accessed=now,
+            worktree_path=worktree_path,
+            origin_path=origin_path,
             source_branch=source_branch,
         )
-        session.save()
         exit_code = run_claude_session(worktree_path, claude_args, session)
     else:
         info(f"Imported session: {imported_uuid}")
-
-        # Create yoloclaude session record
-        session_id = generate_session_id()
-        now = datetime.now().isoformat()
-        session = Session(
-            session_id=session_id,
+        session = create_session(
             project_name=project_name,
             branch=branch_name,
-            worktree_path=str(worktree_path),
-            origin_path=str(origin_path),
-            created_at=now,
-            last_accessed=now,
-            claude_session_id=imported_uuid,
+            worktree_path=worktree_path,
+            origin_path=origin_path,
             source_branch=source_branch,
+            claude_session_id=imported_uuid,
         )
-        session.save()
-
-        info(f"Session ID: {session_id}")
+        info(f"Session ID: {session.session_id}")
 
         # Run claude with --continue to resume the imported session
         import_args = ['--continue'] + list(claude_args)

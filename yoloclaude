@@ -674,65 +674,46 @@ def ensure_user_repo(repo_url: str, repos_dir: Path) -> Path:
 
 def ensure_repo_accessible_to_claude(repo_path: Path) -> None:
     """
-    Ensure the repository is readable AND writable by the claude user.
-    Readable so claude can clone from it, writable so claude can push to it.
+    Ensure the repository is readable by the claude user.
     This may require adjusting directory permissions along the path.
+
+    Note: The origin repo intentionally stays READ-ONLY to claude for sandbox
+    isolation. At session end, yoloclaude (as the invoking user) fetches
+    commits from claude's worktree rather than having claude push.
     """
     # Check if claude can access the repo
     result = subprocess.run(
         ['sudo', '-u', 'claude', 'test', '-r', str(repo_path)],
         capture_output=True
     )
-    needs_read_fix = result.returncode != 0
-
-    # Check if claude can write to the .git directory (needed for push)
-    git_dir = repo_path / '.git'
-    result = subprocess.run(
-        ['sudo', '-u', 'claude', 'test', '-w', str(git_dir)],
-        capture_output=True
-    )
-    needs_write_fix = result.returncode != 0
-
-    if not needs_read_fix and not needs_write_fix:
+    if result.returncode == 0:
         return  # Already accessible
 
-    if needs_read_fix:
-        warn(f"Repository at {repo_path} is not accessible to claude user.")
-        info("Making repository readable (chmod o+rx on repo and parent directories)...")
+    warn(f"Repository at {repo_path} is not accessible to claude user.")
+    info("Making repository readable...")
 
-        # Make each component of the path readable
-        # Start from the repo and work up to find the first accessible parent
-        path = repo_path
-        paths_to_fix = []
-        while path != path.parent:
-            result = subprocess.run(
-                ['sudo', '-u', 'claude', 'test', '-x', str(path)],
-                capture_output=True
-            )
-            if result.returncode == 0:
-                break
-            paths_to_fix.append(path)
-            path = path.parent
+    # Make each component of the path readable
+    # Start from the repo and work up to find the first accessible parent
+    path = repo_path
+    paths_to_fix = []
+    while path != path.parent:
+        result = subprocess.run(
+            ['sudo', '-u', 'claude', 'test', '-x', str(path)],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            break
+        paths_to_fix.append(path)
+        path = path.parent
 
-        # Fix permissions from top to bottom
-        for p in reversed(paths_to_fix):
-            run_cmd(['chmod', 'o+rx', str(p)])
+    # Fix permissions from top to bottom
+    for p in reversed(paths_to_fix):
+        run_cmd(['chmod', 'o+rx', str(p)])
 
-    # Make the repo readable
-    if git_dir.exists() and needs_read_fix:
+    # Make the .git directory readable
+    git_dir = repo_path / '.git'
+    if git_dir.exists():
         run_cmd(['chmod', '-R', 'o+rX', str(git_dir)])
-
-    # Make the entire repo writable so claude can push and working tree can update
-    # Use g+w (group write) because claude is typically in the staff group,
-    # which is the group owner of user directories on macOS
-    if needs_write_fix:
-        info("Making repository writable (needed for push)...")
-        run_cmd(['chmod', '-R', 'g+w', str(repo_path)])
-
-        # Configure repo to accept pushes to the current branch
-        # This updates the working tree after a push, which is what we want
-        info("Configuring repo to accept pushes (receive.denyCurrentBranch=updateInstead)...")
-        run_cmd(['git', '-C', str(repo_path), 'config', 'receive.denyCurrentBranch', 'updateInstead'])
 
 
 def ensure_claude_clone(origin_path: Path) -> Path:
@@ -1100,10 +1081,19 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
         print(unpushed_commits)
         print()
 
-        if prompt_yes_no("Push these commits to your local repo?"):
-            info(f"Pushing to {origin_path}...")
-            run_as_claude(['git', '-C', str(claude_repo_path), 'push', 'origin', 'HEAD'])
-            info("Changes pushed to your local repo.")
+        if prompt_yes_no("Sync these commits to your local repo?"):
+            # Get the current branch name from the worktree
+            branch_result = run_as_claude(
+                ['git', '-C', str(claude_repo_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture=True
+            )
+            branch = branch_result.stdout.strip()
+
+            # Fetch from worktree into origin (as invoking user, not claude)
+            # This keeps the origin read-only to claude for sandbox isolation
+            info(f"Fetching from worktree to {origin_path}...")
+            run_cmd(['git', '-C', str(origin_path), 'fetch', str(claude_repo_path), f'{branch}:{branch}'])
+            info("Changes synced to your local repo.")
 
             # Check if local repo has a remote
             result = run_cmd(
@@ -1113,7 +1103,7 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
             if result.returncode == 0 and result.stdout.strip():
                 print()
                 if prompt_yes_no("Push from your local repo to remote?"):
-                    run_cmd(['git', '-C', str(origin_path), 'push'])
+                    run_cmd(['git', '-C', str(origin_path), 'push', 'origin', branch])
                     info("Changes pushed to remote!")
     else:
         info("No unpushed commits.")

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -92,7 +93,8 @@ def run_cmd(cmd: list[str], check: bool = True, capture: bool = False, **kwargs)
 
 def run_as_claude(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a command as the claude user."""
-    return run_cmd(['sudo', '-u', 'claude'] + cmd, **kwargs)
+    # -H ensures HOME is set to claude's home (needed for git config, etc.)
+    return run_cmd(['sudo', '-H', '-u', 'claude'] + cmd, **kwargs)
 
 
 def path_exists_as_claude(path: Path) -> bool:
@@ -581,6 +583,83 @@ def display_sessions(sessions: list[Session]) -> None:
     print()
 
 
+def get_claude_binary_path() -> str:
+    """
+    Get the path to the claude binary for the claude user.
+
+    We use an explicit path rather than relying on PATH because sudo -i
+    on macOS can inherit PATH from the invoking user, causing it to find
+    the wrong claude installation.
+    """
+    claude_home = get_claude_home()
+    claude_bin = claude_home / ".local" / "bin" / "claude"
+
+    # Check if claude is installed in the expected location
+    if path_exists_as_claude(claude_bin):
+        return str(claude_bin)
+
+    # Fall back to just 'claude' and hope PATH is correct
+    warn(f"Claude not found at {claude_bin}, falling back to PATH lookup")
+    return "claude"
+
+
+def fix_feature_flags(claude_home: Path) -> None:
+    """
+    Fix feature flags in Claude's config that cause hanging when enabled.
+
+    Some feature flags (tengu_mcp_tool_search, tengu_scratch) enable features
+    that don't work properly when running as a sandboxed user, causing Claude
+    to hang on startup. This function disables those flags.
+    """
+    config_path = claude_home / ".claude.json"
+
+    # Read the config file as claude user
+    result = subprocess.run(
+        ['sudo', '-H', '-u', 'claude', 'cat', str(config_path)],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        return  # Config doesn't exist yet, nothing to fix
+
+    try:
+        config = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return  # Invalid JSON, skip
+
+    # Check if we need to fix any flags
+    features = config.get("cachedGrowthBookFeatures", {})
+    needs_fix = False
+
+    # Flags that cause hanging when enabled
+    problematic_flags = ["tengu_mcp_tool_search", "tengu_scratch"]
+
+    for flag in problematic_flags:
+        if features.get(flag) == True:
+            features[flag] = False
+            needs_fix = True
+
+    if not needs_fix:
+        return
+
+    # Write the fixed config back
+    config["cachedGrowthBookFeatures"] = features
+    config_json = json.dumps(config, indent=2)
+
+    # Use a temp file and move to avoid permission issues
+    result = subprocess.run(
+        ['sudo', '-H', '-u', 'claude', 'bash', '-c',
+         f'cat > {shlex.quote(str(config_path))}'],
+        input=config_json,
+        text=True,
+        capture_output=True
+    )
+
+    if result.returncode != 0:
+        warn(f"Failed to update Claude config: {result.stderr}")
+
+
 def run_claude_session(project_path: Path, claude_args: list[str], session: Optional[Session] = None) -> int:
     """
     Run Claude Code as the claude user in the project directory.
@@ -590,16 +669,37 @@ def run_claude_session(project_path: Path, claude_args: list[str], session: Opti
     info("Running as user: claude")
     print()
 
-    # Build the command
-    # We use sudo -i to get a login shell environment, then cd and run claude
+    # Get the full path to claude binary (avoids PATH inheritance issues on macOS)
+    claude_bin = get_claude_binary_path()
+
+    # Build the command with a clean PATH
+    # We explicitly set PATH to avoid inheriting the invoking user's PATH,
+    # which may contain their own Claude Code installation
+    claude_home = get_claude_home()
+    clean_path = f"{claude_home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # On macOS, unlock the keychain before running claude
+    # The keychain may have auto-locked, which causes claude to hang when accessing credentials
+    keychain_unlock = ""
+    if sys.platform == "darwin":
+        keychain_path = f"{claude_home}/Library/Keychains/login.keychain-db"
+        keychain_unlock = f'security unlock-keychain -p "claude" {shlex.quote(keychain_path)} 2>/dev/null || true; '
+
+    # Fix feature flags that cause hanging when enabled
+    # These flags (tengu_mcp_tool_search, tengu_scratch) enable features that don't work
+    # properly when running as a sandboxed user, causing Claude to hang on startup
+    fix_feature_flags(claude_home)
+
+    args_str = " ".join(shlex.quote(arg) for arg in claude_args)
     cmd = [
-        'sudo', '-u', 'claude', '-i',
+        'sudo', '-H', '-u', 'claude',
         'bash', '-c',
-        f'cd {project_path} && claude --dangerously-skip-permissions {" ".join(claude_args)}'
+        f'{keychain_unlock}export PATH={shlex.quote(clean_path)} && cd {shlex.quote(str(project_path))} && {shlex.quote(claude_bin)} --dangerously-skip-permissions {args_str}'
     ]
 
-    # Run interactively (don't capture output)
-    result = subprocess.run(cmd)
+    # Run from /tmp to avoid Claude Code picking up .claude settings from the
+    # invoking directory (which claude user may not have access to)
+    result = subprocess.run(cmd, cwd="/tmp")
     return result.returncode
 
 

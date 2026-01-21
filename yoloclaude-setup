@@ -94,6 +94,36 @@ create_user_macos() {
     dscl . -create /Users/claude IsHidden 1
 
     info "Created claude user with UID $uid"
+
+    # Create a keychain for the claude user
+    # This is needed for Claude Code to store OAuth credentials
+    setup_macos_keychain
+}
+
+# Set up keychain for claude user on macOS
+setup_macos_keychain() {
+    info "Setting up keychain for claude user..."
+
+    local keychain_dir="/Users/claude/Library/Keychains"
+    local keychain_path="$keychain_dir/login.keychain-db"
+
+    # Create Keychains directory if it doesn't exist
+    sudo -H -u claude mkdir -p "$keychain_dir"
+
+    # Create the keychain with a simple password (security is via Unix permissions, not keychain password)
+    # The keychain password is 'claude' - this is fine since the user account itself is the security boundary
+    sudo -H -u claude security create-keychain -p "claude" "$keychain_path" 2>/dev/null || true
+
+    # Set it as the default keychain
+    sudo -H -u claude security default-keychain -s "$keychain_path" 2>/dev/null || true
+
+    # Unlock the keychain (it will stay unlocked for this session)
+    sudo -H -u claude security unlock-keychain -p "claude" "$keychain_path" 2>/dev/null || true
+
+    # Set keychain settings to not auto-lock (since this is a service account)
+    sudo -H -u claude security set-keychain-settings "$keychain_path" 2>/dev/null || true
+
+    info "Keychain created at $keychain_path"
 }
 
 # Create claude user on Linux
@@ -175,9 +205,35 @@ setup_git_config() {
     info "Configured git for claude user"
 }
 
+# Set up PATH for the claude user
+setup_claude_path() {
+    local claude_home
+    if [[ "$PLATFORM" == "macos" ]]; then
+        claude_home="/Users/claude"
+    else
+        claude_home="/home/claude"
+    fi
+
+    # Add ~/.local/bin to PATH in both .bashrc and .zshrc
+    local path_line='export PATH="$HOME/.local/bin:$PATH"'
+
+    for rcfile in ".bashrc" ".zshrc" ".profile"; do
+        local rcpath="$claude_home/$rcfile"
+        # Create file if it doesn't exist, or append if the line isn't already there
+        if [[ ! -f "$rcpath" ]] || ! grep -qF '.local/bin' "$rcpath" 2>/dev/null; then
+            echo "$path_line" | sudo -H -u claude tee -a "$rcpath" > /dev/null
+        fi
+    done
+
+    info "Added ~/.local/bin to claude user's PATH"
+}
+
 # Install Claude Code for the claude user
 install_claude_code() {
     info "Installing Claude Code for claude user..."
+
+    # First ensure PATH is set up so the installer's advice is already handled
+    setup_claude_path
 
     # Use the official installer, which installs to ~/.local/bin/claude
     # The -H flag ensures HOME is set correctly
@@ -267,6 +323,7 @@ main() {
     create_directories
     configure_sudo
     setup_git_config
+    install_claude_code || true  # Don't fail if install fails - user can install manually
     print_instructions
 }
 

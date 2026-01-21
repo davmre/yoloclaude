@@ -77,6 +77,108 @@ def get_user_repos_dir() -> Path:
     return Path.home() / "repos"
 
 
+def encode_claude_path(path: Path) -> str:
+    """
+    Encode a filesystem path to Claude's session directory format.
+    /Users/dave/repos/myproject -> -Users-dave-repos-myproject
+    """
+    return str(path.resolve()).replace('/', '-')
+
+
+def find_claude_sessions(repo_path: Path) -> list[dict]:
+    """
+    Find Claude sessions for a given repo path.
+    Returns list of session info dicts with uuid, path, and modified time.
+    Sorted by modification time, most recent first.
+    """
+    claude_dir = Path.home() / '.claude' / 'projects' / encode_claude_path(repo_path)
+    if not claude_dir.exists():
+        return []
+
+    sessions = []
+    for f in claude_dir.glob('*.jsonl'):
+        # Skip summary files
+        if f.name.startswith('session-summary'):
+            continue
+        sessions.append({
+            'uuid': f.stem,
+            'path': f,
+            'modified': f.stat().st_mtime
+        })
+    return sorted(sessions, key=lambda s: s['modified'], reverse=True)
+
+
+def format_session_time(mtime: float) -> str:
+    """Format a modification time for display."""
+    return datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def import_claude_session(source_repo: Path, worktree_path: Path, session_uuid: Optional[str] = None) -> Optional[str]:
+    """
+    Import Claude session files from source repo to worktree location.
+
+    Args:
+        source_repo: Original repo path (invoking user's repo)
+        worktree_path: yoloclaude worktree path (claude user's worktree)
+        session_uuid: Specific session to import, or None for most recent
+
+    Returns:
+        The UUID of the imported session, or None if import failed.
+    """
+    # Find source sessions
+    source_sessions = find_claude_sessions(source_repo)
+    if not source_sessions:
+        warn(f"No Claude sessions found for {source_repo}")
+        return None
+
+    # Select session to import
+    if session_uuid:
+        session = next((s for s in source_sessions if s['uuid'] == session_uuid), None)
+        if not session:
+            warn(f"Session {session_uuid} not found")
+            return None
+    else:
+        session = source_sessions[0]  # Most recent
+
+    # Create target directory (as claude user)
+    claude_home = get_claude_home()
+    target_dir = claude_home / '.claude' / 'projects' / encode_claude_path(worktree_path)
+
+    # Create directory structure as claude user
+    run_as_claude(['mkdir', '-p', str(target_dir)])
+
+    # Copy session file(s)
+    # We read the file as the invoking user and pipe it to claude user via tee,
+    # since the claude user can't read the invoking user's ~/.claude directory
+    source_file = session['path']
+    target_file = target_dir / source_file.name
+
+    info(f"Importing session {session['uuid']}")
+    with open(source_file, 'rb') as f:
+        content = f.read()
+    subprocess.run(
+        ['sudo', '-u', 'claude', 'tee', str(target_file)],
+        input=content,
+        stdout=subprocess.DEVNULL,
+        check=True
+    )
+
+    # Also copy any summary files
+    summary_file = source_file.parent / f"session-summary-{session['uuid']}.jsonl"
+    if summary_file.exists():
+        target_summary = target_dir / summary_file.name
+        with open(summary_file, 'rb') as f:
+            content = f.read()
+        subprocess.run(
+            ['sudo', '-u', 'claude', 'tee', str(target_summary)],
+            input=content,
+            stdout=subprocess.DEVNULL,
+            check=True
+        )
+
+    return session['uuid']
+
+
 def run_cmd(cmd: list[str], check: bool = True, capture: bool = False, **kwargs) -> subprocess.CompletedProcess:
     """Run a command and optionally capture output."""
     if capture:
@@ -1158,6 +1260,107 @@ def cmd_start_session(origin_path: Path, claude_args: list[str]) -> int:
     return exit_code
 
 
+def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_args: list[str]) -> int:
+    """
+    Handle --import-claude command.
+    Import a Claude session from a local repo into yoloclaude sandbox.
+    Returns exit code from Claude.
+    """
+    # Validate import path
+    if not import_path.exists():
+        error(f"Path does not exist: {import_path}")
+    if not (import_path / '.git').exists():
+        error(f"Not a git repo: {import_path}")
+
+    # Check for existing sessions
+    sessions = find_claude_sessions(import_path)
+    if not sessions:
+        error(
+            f"No Claude sessions found for {import_path}\n"
+            "Run 'claude' in that directory first to create a session."
+        )
+
+    # Show available sessions
+    if len(sessions) > 1 and not session_uuid:
+        info(f"Found {len(sessions)} sessions:")
+        for i, s in enumerate(sessions[:5]):
+            print(f"  {i+1}. {s['uuid']} (modified: {format_session_time(s['modified'])})")
+        if len(sessions) > 5:
+            print(f"  ... and {len(sessions) - 5} more")
+        print()
+        info("Using most recent session. Use --session <id> to import a specific one.")
+        print()
+    elif session_uuid:
+        # Verify the session exists
+        if not any(s['uuid'] == session_uuid for s in sessions):
+            error(f"Session {session_uuid} not found for {import_path}")
+
+    # Set up yoloclaude environment
+    origin_path = import_path.resolve()
+    project_name = origin_path.name
+
+    info(f"Import from: {origin_path}")
+    info(f"Project: {project_name}")
+
+    # Ensure origin is accessible and create claude's clone
+    ensure_repo_accessible_to_claude(origin_path)
+    base_repo = ensure_claude_clone(origin_path)
+
+    # Get branch name
+    branch_name = prompt_branch_name(project_name)
+
+    # Create worktree
+    worktree_path = create_worktree(base_repo, origin_path, branch_name)
+
+    # Import the Claude session
+    imported_uuid = import_claude_session(origin_path, worktree_path, session_uuid)
+
+    if not imported_uuid:
+        warn("Session import failed. Starting fresh session.")
+        # Fall back to normal new session behavior
+        session_id = generate_session_id()
+        now = datetime.now().isoformat()
+        session = Session(
+            session_id=session_id,
+            project_name=project_name,
+            branch=branch_name,
+            worktree_path=str(worktree_path),
+            origin_path=str(origin_path),
+            created_at=now,
+            last_accessed=now,
+        )
+        session.save()
+        exit_code = run_claude_session(worktree_path, claude_args, session)
+    else:
+        info(f"Imported session: {imported_uuid}")
+
+        # Create yoloclaude session record
+        session_id = generate_session_id()
+        now = datetime.now().isoformat()
+        session = Session(
+            session_id=session_id,
+            project_name=project_name,
+            branch=branch_name,
+            worktree_path=str(worktree_path),
+            origin_path=str(origin_path),
+            created_at=now,
+            last_accessed=now,
+            claude_session_id=imported_uuid,
+        )
+        session.save()
+
+        info(f"Session ID: {session_id}")
+
+        # Run claude with --continue to resume the imported session
+        import_args = ['--continue'] + list(claude_args)
+        exit_code = run_claude_session(worktree_path, import_args, session)
+
+    # Handle end of session
+    handle_end_of_session(worktree_path, origin_path)
+
+    return exit_code
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1178,6 +1381,9 @@ Examples:
   yoloclaude myproject --list-worktrees       # List worktrees for a project
   yoloclaude myproject --clear-worktree=name  # Remove a specific worktree
   yoloclaude myproject --clear-worktrees      # Remove all worktrees for a project
+  yoloclaude --import-claude                  # Import Claude session from current dir
+  yoloclaude --import-claude /path/to/repo    # Import Claude session from specified path
+  yoloclaude --import-claude . --session abc  # Import specific session by ID
         """
     )
     parser.add_argument(
@@ -1227,6 +1433,18 @@ Examples:
         action='store_true',
         help='Remove all worktrees for a project'
     )
+    parser.add_argument(
+        '--import-claude',
+        nargs='?',
+        const='.',
+        metavar='PATH',
+        help='Import Claude session from local repo into yoloclaude sandbox'
+    )
+    parser.add_argument(
+        '--session',
+        metavar='SESSION_ID',
+        help='Specific Claude session ID to import (used with --import-claude)'
+    )
 
     args = parser.parse_args()
 
@@ -1274,6 +1492,12 @@ Examples:
     if args.resume is not None:
         session_id = None if args.resume == '__list__' else args.resume
         exit_code = cmd_resume(session_id, args.claude_args)
+        sys.exit(exit_code)
+
+    # Handle --import-claude
+    if args.import_claude is not None:
+        import_path = Path(args.import_claude).resolve()
+        exit_code = cmd_import_claude(import_path, args.session, args.claude_args)
         sys.exit(exit_code)
 
     # Commands below require a repo argument

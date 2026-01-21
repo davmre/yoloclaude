@@ -241,6 +241,268 @@ def find_session(session_id_prefix: str) -> Optional[Session]:
     return None
 
 
+# =============================================================================
+# Worktree Management
+# =============================================================================
+
+def get_worktree_name(session: Session) -> str:
+    """
+    Extract worktree name from session's branch.
+    Branch: 'claude/aerie-20260121-143022-ab12' -> Worktree name: 'aerie-20260121-143022-ab12'
+    """
+    branch = session.branch
+    if branch.startswith('claude/'):
+        return branch[len('claude/'):]
+    return branch
+
+
+def find_session_by_worktree(project_name: str, worktree_name: str) -> Optional[Session]:
+    """
+    Find a session by project name and worktree name.
+    Supports prefix matching for worktree names.
+    """
+    sessions = list_sessions(project_filter=project_name)
+    if not sessions:
+        return None
+
+    # Try exact match first
+    for session in sessions:
+        if get_worktree_name(session) == worktree_name:
+            return session
+
+    # Try prefix match
+    matches = [s for s in sessions if get_worktree_name(s).startswith(worktree_name)]
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        worktree_names = [get_worktree_name(s) for s in matches]
+        error(f"Ambiguous worktree prefix '{worktree_name}'. Matches: {worktree_names}")
+
+    return None
+
+
+def resolve_project_name(name: str) -> Optional[Path]:
+    """
+    Resolve a project name to its origin path.
+    1. First check ~/repos/<name>
+    2. Then scan existing sessions for matching project_name and use its origin_path
+    """
+    repos_dir = get_user_repos_dir()
+
+    # Check ~/repos/ first
+    repo_path = repos_dir / name
+    if repo_path.exists() and (repo_path / '.git').exists():
+        return repo_path
+
+    # Check existing sessions
+    sessions = list_sessions(project_filter=name)
+    if sessions:
+        # Use the most recently accessed session's origin path
+        origin_path = Path(sessions[0].origin_path)
+        if origin_path.exists():
+            return origin_path
+
+    return None
+
+
+def extract_project_name(repo: str) -> str:
+    """
+    Extract project name from repo argument.
+    This is the basename of the repo path/URL without .git suffix.
+    """
+    return extract_repo_name(repo)
+
+
+def check_worktree_status(session: Session) -> str:
+    """
+    Check the status of a worktree.
+    Returns: 'clean', 'modified', or 'missing'
+    """
+    worktree_path = Path(session.worktree_path)
+
+    # Check if worktree directory exists
+    if not path_exists_as_claude(worktree_path):
+        return "missing"
+
+    # Check for uncommitted changes
+    result = run_as_claude(
+        ['git', '-C', str(worktree_path), 'status', '--porcelain'],
+        capture=True, check=False
+    )
+
+    if result.returncode != 0:
+        return "missing"  # Git command failed, probably not a valid repo
+
+    if result.stdout.strip():
+        return "modified"
+
+    return "clean"
+
+
+def display_worktrees(sessions: list[Session]) -> None:
+    """Display worktrees in a table format with status."""
+    if not sessions:
+        info("No worktrees found for this project.")
+        return
+
+    print()
+    print(f"{'#':<4} {'Worktree Name':<40} {'Last Accessed':<20} {'Status':<10}")
+    print("-" * 75)
+
+    for i, session in enumerate(sessions, 1):
+        worktree_name = get_worktree_name(session)
+        # Truncate if too long
+        if len(worktree_name) > 38:
+            worktree_name = worktree_name[:35] + "..."
+        last_accessed = session.last_accessed[:19]  # Just datetime part
+        status = check_worktree_status(session)
+
+        # Color-code status
+        if status == "clean":
+            status_str = f"{Colors.GREEN}{status}{Colors.NC}"
+        elif status == "modified":
+            status_str = f"{Colors.YELLOW}{status}{Colors.NC}"
+        else:  # missing
+            status_str = f"{Colors.RED}{status}{Colors.NC}"
+
+        print(f"{i:<4} {worktree_name:<40} {last_accessed:<20} {status_str:<10}")
+
+    print()
+
+
+def remove_worktree(session: Session, force: bool = False) -> bool:
+    """
+    Safely remove a worktree and its session.
+    Returns True if successful, False if cancelled.
+
+    - Warns if worktree has uncommitted changes (unless force=True)
+    - Runs `git worktree remove` as claude user
+    - Deletes the branch
+    - Deletes session JSON file
+    """
+    worktree_path = Path(session.worktree_path)
+    status = check_worktree_status(session)
+
+    # Warn about uncommitted changes
+    if status == "modified" and not force:
+        warn(f"Worktree '{get_worktree_name(session)}' has uncommitted changes!")
+        if not prompt_yes_no("Remove anyway? (changes will be lost)"):
+            return False
+
+    # Get the base repo path (claude's clone)
+    claude_home = get_claude_home()
+    base_repo = claude_home / "projects" / session.project_name
+
+    # Remove the worktree if it exists
+    if status != "missing":
+        info(f"Removing worktree: {worktree_path}")
+        result = run_as_claude(
+            ['git', '-C', str(base_repo), 'worktree', 'remove', '--force', str(worktree_path)],
+            check=False, capture=True
+        )
+        if result.returncode != 0:
+            # Fall back to rm -rf
+            warn(f"git worktree remove failed, removing directory directly")
+            run_as_claude(['rm', '-rf', str(worktree_path)], check=False)
+            # Prune worktree list
+            run_as_claude(['git', '-C', str(base_repo), 'worktree', 'prune'], check=False)
+
+    # Delete the branch
+    branch = session.branch
+    info(f"Deleting branch: {branch}")
+    run_as_claude(
+        ['git', '-C', str(base_repo), 'branch', '-D', branch],
+        check=False, capture=True
+    )
+
+    # Delete session file
+    session_file = get_sessions_dir() / f"{session.session_id}.json"
+    if session_file.exists():
+        info(f"Removing session file: {session_file}")
+        session_file.unlink()
+
+    info(f"Worktree '{get_worktree_name(session)}' removed successfully.")
+    return True
+
+
+def remove_all_worktrees(project_name: str, force: bool = False) -> int:
+    """
+    Remove all worktrees for a project.
+    Returns the number of worktrees removed.
+    """
+    sessions = list_sessions(project_filter=project_name)
+    if not sessions:
+        info(f"No worktrees found for project '{project_name}'.")
+        return 0
+
+    # Display worktrees
+    print()
+    info(f"Found {len(sessions)} worktree(s) for project '{project_name}':")
+    display_worktrees(sessions)
+
+    # Check for modified worktrees
+    modified = [s for s in sessions if check_worktree_status(s) == "modified"]
+    if modified and not force:
+        warn(f"{len(modified)} worktree(s) have uncommitted changes!")
+
+    if not force:
+        if not prompt_yes_no(f"Remove all {len(sessions)} worktree(s)?", default=False):
+            info("Cancelled.")
+            return 0
+
+    removed = 0
+    for session in sessions:
+        if remove_worktree(session, force=True):  # force=True since we already confirmed
+            removed += 1
+
+    info(f"Removed {removed} of {len(sessions)} worktree(s).")
+    return removed
+
+
+def prompt_worktree_choice(sessions: list[Session]) -> Optional[Session]:
+    """
+    Interactive menu to choose a worktree or create a new one.
+    Returns the selected session, or None if user wants to create a new worktree.
+    Skips prompt in non-interactive mode (--yes flag) and returns None.
+    """
+    if AUTO_YES:
+        info("Creating new worktree [auto-yes mode]")
+        return None
+
+    if not sessions:
+        return None
+
+    print()
+    info("Existing worktrees for this project:")
+    display_worktrees(sessions)
+
+    print("Options:")
+    print("  [1-N] Resume a worktree by number")
+    print("  [n]   Create a new worktree")
+    print("  [q]   Quit")
+    print()
+
+    while True:
+        choice = prompt("Your choice").strip().lower()
+
+        if choice == 'q':
+            info("Exiting.")
+            sys.exit(0)
+
+        if choice == 'n':
+            return None  # Create new worktree
+
+        # Try to parse as number
+        try:
+            num = int(choice)
+            if 1 <= num <= len(sessions):
+                return sessions[num - 1]
+            else:
+                warn(f"Invalid number. Please enter 1-{len(sessions)}, 'n', or 'q'.")
+        except ValueError:
+            warn("Invalid choice. Please enter a number, 'n', or 'q'.")
+
+
 def is_git_url(repo: str) -> bool:
     """Check if the repo argument looks like a git URL."""
     # HTTPS URLs
@@ -774,6 +1036,10 @@ Examples:
   yoloclaude --resume                         # List sessions and pick one to resume
   yoloclaude --resume abc123                  # Resume session by ID
   yoloclaude --list                           # List all sessions
+  yoloclaude myproject -w worktree-name       # Resume specific worktree directly
+  yoloclaude myproject --list-worktrees       # List worktrees for a project
+  yoloclaude myproject --clear-worktree=name  # Remove a specific worktree
+  yoloclaude myproject --clear-worktrees      # Remove all worktrees for a project
         """
     )
     parser.add_argument(
@@ -803,6 +1069,26 @@ Examples:
         action='store_true',
         help='List all sessions'
     )
+    parser.add_argument(
+        '-w', '--worktree',
+        metavar='NAME',
+        help='Resume a specific worktree directly (supports prefix matching)'
+    )
+    parser.add_argument(
+        '--list-worktrees',
+        action='store_true',
+        help='List worktrees for a project'
+    )
+    parser.add_argument(
+        '--clear-worktree',
+        metavar='NAME',
+        help='Remove a specific worktree'
+    )
+    parser.add_argument(
+        '--clear-worktrees',
+        action='store_true',
+        help='Remove all worktrees for a project'
+    )
 
     args = parser.parse_args()
 
@@ -824,6 +1110,38 @@ Examples:
     if args.list:
         sessions = list_sessions()
         display_sessions(sessions)
+        sys.exit(0)
+
+    # Handle --list-worktrees (requires a project name)
+    if args.list_worktrees:
+        if not args.repo:
+            error("--list-worktrees requires a project name")
+        project_name = extract_project_name(args.repo)
+        sessions = list_sessions(project_filter=project_name)
+        if not sessions:
+            info(f"No worktrees found for project '{project_name}'.")
+        else:
+            info(f"Worktrees for project '{project_name}':")
+            display_worktrees(sessions)
+        sys.exit(0)
+
+    # Handle --clear-worktree (requires a project name)
+    if args.clear_worktree:
+        if not args.repo:
+            error("--clear-worktree requires a project name")
+        project_name = extract_project_name(args.repo)
+        session = find_session_by_worktree(project_name, args.clear_worktree)
+        if not session:
+            error(f"Worktree '{args.clear_worktree}' not found for project '{project_name}'")
+        remove_worktree(session)
+        sys.exit(0)
+
+    # Handle --clear-worktrees (requires a project name)
+    if args.clear_worktrees:
+        if not args.repo:
+            error("--clear-worktrees requires a project name")
+        project_name = extract_project_name(args.repo)
+        remove_all_worktrees(project_name)
         sys.exit(0)
 
     # Handle --resume
@@ -882,12 +1200,39 @@ Examples:
         if not (origin_path / '.git').exists():
             error(f"{origin_path} is not a git repository")
     else:
-        error(
-            f"Cannot find repository: {repo}\n"
-            "Provide a git URL, local path, or existing project name in ~/repos/"
-        )
+        # Try to resolve via "memory" feature (previous sessions)
+        resolved_path = resolve_project_name(repo)
+        if resolved_path:
+            origin_path = resolved_path
+            info(f"Resolved '{repo}' from previous session")
+        else:
+            error(
+                f"Cannot find repository: {repo}\n"
+                "Provide a git URL, local path, or existing project name in ~/repos/"
+            )
 
     info(f"Origin (your local repo): {origin_path}")
+
+    # Get project name for worktree operations
+    project_name = origin_path.name
+
+    # Handle --worktree: resume a specific worktree
+    if args.worktree:
+        session = find_session_by_worktree(project_name, args.worktree)
+        if not session:
+            error(f"Worktree '{args.worktree}' not found for project '{project_name}'")
+        exit_code = resume_session(session, args.claude_args)
+        sys.exit(exit_code)
+
+    # Check for existing worktrees and prompt user
+    existing_sessions = list_sessions(project_filter=project_name)
+    if existing_sessions:
+        selected_session = prompt_worktree_choice(existing_sessions)
+        if selected_session:
+            # User chose to resume an existing worktree
+            exit_code = resume_session(selected_session, args.claude_args)
+            sys.exit(exit_code)
+        # Otherwise, continue to create a new worktree
 
     # Start new session with worktree
     session, exit_code = start_new_session(origin_path, args.claude_args)

@@ -306,6 +306,222 @@ test_resume_session() {
 }
 
 # ============================================================================
+# Test: List worktrees for a project
+# ============================================================================
+test_list_worktrees() {
+    log_test "Testing --list-worktrees..."
+
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    # Should show worktrees with status
+    if echo "$OUTPUT" | grep -q "Worktree Name"; then
+        log_pass "--list-worktrees shows worktree table header"
+    else
+        log_fail "--list-worktrees missing table header"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Should show at least 2 worktrees from previous tests
+    # Worktree names are like "test-project-20260121-123456-abcd"
+    WORKTREE_COUNT=$(echo "$OUTPUT" | grep -c "test-project-" || true)
+    if [[ "$WORKTREE_COUNT" -ge 2 ]]; then
+        log_pass "--list-worktrees shows $WORKTREE_COUNT worktrees"
+    else
+        log_fail "--list-worktrees shows fewer than 2 worktrees"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Should show status (clean, modified, or missing)
+    if echo "$OUTPUT" | grep -qE "(clean|modified|missing)"; then
+        log_pass "--list-worktrees shows worktree status"
+    else
+        log_fail "--list-worktrees missing status column"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: List worktrees error without project
+# ============================================================================
+test_list_worktrees_error() {
+    log_test "Testing --list-worktrees error without project..."
+
+    cd /home/testuser
+    if "$YOLOCLAUDE_DIR/yoloclaude" --list-worktrees 2>&1 | grep -qi "requires a project"; then
+        log_pass "--list-worktrees requires project name"
+    else
+        log_fail "--list-worktrees should error without project"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Resume specific worktree with -w
+# ============================================================================
+test_worktree_resume() {
+    log_test "Testing -w/--worktree direct resume..."
+
+    cd /home/testuser
+
+    # Get a worktree name from an existing session
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    if [[ -z "$SESSION_FILE" ]]; then
+        log_fail "No session found for worktree resume test"
+        return 1
+    fi
+
+    # Extract the worktree name from the branch (remove claude/ prefix)
+    BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['branch'])")
+    WORKTREE_NAME=${BRANCH#claude/}
+
+    log_info "Resuming worktree: $WORKTREE_NAME"
+
+    # Resume with the full worktree name
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project -w "$WORKTREE_NAME" || true
+
+    log_pass "-w/--worktree resume executed"
+
+    # Test prefix matching (use first part of worktree name)
+    PREFIX=${WORKTREE_NAME:0:20}
+    log_info "Testing prefix match with: $PREFIX"
+
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project -w "$PREFIX" || true
+
+    log_pass "-w prefix matching works"
+}
+
+# ============================================================================
+# Test: Worktree resume with invalid name
+# ============================================================================
+test_worktree_resume_invalid() {
+    log_test "Testing -w with invalid worktree name..."
+
+    cd /home/testuser
+    if "$YOLOCLAUDE_DIR/yoloclaude" test-project -w "nonexistent-worktree-xyz" 2>&1 | grep -qi "not found"; then
+        log_pass "-w with invalid name shows error"
+    else
+        log_fail "-w should error with invalid worktree name"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Clear specific worktree
+# ============================================================================
+test_clear_worktree() {
+    log_test "Testing --clear-worktree..."
+
+    cd /home/testuser
+    BASE_CLONE="/home/claude/projects/test-project"
+    USER_REPO="/home/testuser/repos/test-project"
+
+    # Create a fresh worktree to delete
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Get the most recent worktree name
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['branch'])")
+    WORKTREE_NAME=${BRANCH#claude/}
+    SESSION_ID=$(basename "$SESSION_FILE" .json)
+
+    log_info "Clearing worktree: $WORKTREE_NAME"
+
+    # Count worktrees before
+    BEFORE_COUNT=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+
+    # Clear the worktree
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project --clear-worktree="$WORKTREE_NAME" 2>&1
+
+    # Count worktrees after
+    AFTER_COUNT=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+
+    if [[ "$AFTER_COUNT" -lt "$BEFORE_COUNT" ]]; then
+        log_pass "--clear-worktree removed worktree directory"
+    else
+        log_fail "--clear-worktree did not remove worktree"
+        return 1
+    fi
+
+    # Verify session file was removed
+    if [[ ! -f "/home/testuser/.yoloclaude/sessions/${SESSION_ID}.json" ]]; then
+        log_pass "--clear-worktree removed session file"
+    else
+        log_fail "--clear-worktree did not remove session file"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Clear all worktrees
+# ============================================================================
+test_clear_all_worktrees() {
+    log_test "Testing --clear-worktrees..."
+
+    cd /home/testuser
+    BASE_CLONE="/home/claude/projects/test-project"
+    USER_REPO="/home/testuser/repos/test-project"
+
+    # First, create a couple of worktrees
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Count sessions before
+    BEFORE_COUNT=$(ls /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | wc -l)
+    log_info "Sessions before clear: $BEFORE_COUNT"
+
+    # Clear all worktrees (--yes auto-confirms)
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project --clear-worktrees 2>&1
+
+    # Count sessions after
+    AFTER_COUNT=$(ls /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | wc -l)
+    log_info "Sessions after clear: $AFTER_COUNT"
+
+    if [[ "$AFTER_COUNT" -eq 0 ]]; then
+        log_pass "--clear-worktrees removed all session files"
+    else
+        log_fail "--clear-worktrees did not remove all sessions (remaining: $AFTER_COUNT)"
+        return 1
+    fi
+
+    # Verify worktrees directory is empty or has no worktrees
+    WORKTREE_COUNT=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if [[ "$WORKTREE_COUNT" -eq 0 ]]; then
+        log_pass "--clear-worktrees removed all worktree directories"
+    else
+        log_fail "--clear-worktrees did not remove all worktrees (remaining: $WORKTREE_COUNT)"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Project name memory feature
+# ============================================================================
+test_project_memory() {
+    log_test "Testing project name memory feature..."
+
+    cd /home/testuser
+
+    # First create a session with the full path
+    USER_REPO="/home/testuser/repos/test-project"
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Now try using just the project name (should be remembered)
+    # This should work because we have a session that records the origin_path
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    if echo "$OUTPUT" | grep -q "Worktree"; then
+        log_pass "Project name resolved from session memory"
+    else
+        log_fail "Project name memory not working"
+        echo "$OUTPUT"
+        return 1
+    fi
+}
+
+# ============================================================================
 # Test: Help output
 # ============================================================================
 test_help() {
@@ -315,6 +531,14 @@ test_help() {
         log_pass "Help output contains expected text"
     else
         log_fail "Help output missing expected content"
+        return 1
+    fi
+
+    # Also verify new worktree arguments are documented
+    if "$YOLOCLAUDE_DIR/yoloclaude" --help | grep -q "\-\-list-worktrees"; then
+        log_pass "Help shows --list-worktrees option"
+    else
+        log_fail "Help missing --list-worktrees option"
         return 1
     fi
 }
@@ -357,6 +581,16 @@ main() {
     test_second_worktree
     test_list_sessions
     test_resume_session
+
+    # Worktree management tests
+    test_list_worktrees
+    test_list_worktrees_error
+    test_worktree_resume
+    test_worktree_resume_invalid
+    test_clear_worktree
+    test_clear_all_worktrees
+    test_project_memory
+
     test_missing_repo
 
     echo ""

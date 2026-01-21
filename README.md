@@ -28,7 +28,6 @@ Claude's git "origin" points to your local repository, not the remote. This mean
 - macOS or Linux
 - Python 3.9+
 - `sudo` access
-- Claude Code CLI installed (`npm install -g @anthropic-ai/claude-code` or similar)
 
 ### Setup
 
@@ -43,13 +42,21 @@ Claude's git "origin" points to your local repository, not the remote. This mean
    sudo ./yoloclaude-setup
    ```
 
-3. Authenticate Claude Code for the `claude` user:
+3. Install Claude Code for the `claude` user:
    ```bash
-   sudo -u claude -i claude
+   sudo -H -u claude -i
+   curl -fsSL https://claude.ai/install.sh | sh
+   exit
+   ```
+   This gives the claude user its own installation that can auto-update.
+
+4. Authenticate Claude Code for the `claude` user:
+   ```bash
+   sudo -H -u claude -i claude
    ```
    Complete the authentication flow, then exit with `/exit`.
 
-4. Add `yoloclaude` to your PATH (optional):
+5. Add `yoloclaude` to your PATH (optional):
    ```bash
    # Add to ~/.bashrc or ~/.zshrc:
    export PATH="/path/to/yoloclaude:$PATH"
@@ -136,11 +143,20 @@ Make sure you've run `sudo ./yoloclaude-setup` from your regular user account.
 
 Run the setup script: `sudo ./yoloclaude-setup`
 
+### "claude: command not found"
+
+Claude Code needs to be installed for the claude user (not just your regular user):
+```bash
+sudo -H -u claude -i
+curl -fsSL https://claude.ai/install.sh | sh
+exit
+```
+
 ### Authentication issues
 
 Re-run the Claude Code auth as the claude user:
 ```bash
-sudo -u claude -i claude
+sudo -H -u claude -i claude
 ```
 
 ## Development

@@ -120,7 +120,10 @@ create_directories() {
     mkdir -p "$claude_home/projects"
     mkdir -p "$claude_home/.yoloclaude"
 
-    chown -R claude:$(id -gn claude) "$claude_home"
+    # Only chown the directories we created, not the entire home
+    # (macOS creates system-protected dirs in ~/Library that even root can't modify)
+    chown -R claude:$(id -gn claude) "$claude_home/projects"
+    chown -R claude:$(id -gn claude) "$claude_home/.yoloclaude"
 
     info "Created $claude_home/projects and $claude_home/.yoloclaude"
 }
@@ -160,24 +163,48 @@ setup_git_config() {
     fi
 
     # Create .gitconfig
-    sudo -u claude git config --global user.name "Claude Code"
-    sudo -u claude git config --global user.email "claude@localhost"
-    sudo -u claude git config --global init.defaultBranch main
+    # Note: -H flag ensures HOME is set to claude's home directory (critical on macOS)
+    sudo -H -u claude git config --global user.name "Claude Code"
+    sudo -H -u claude git config --global user.email "claude@localhost"
+    sudo -H -u claude git config --global init.defaultBranch main
 
     # Allow claude to access repos owned by other users
     # This is needed because claude clones from the invoking user's local repos
-    sudo -u claude git config --global safe.directory '*'
+    sudo -H -u claude git config --global safe.directory '*'
 
     info "Configured git for claude user"
+}
+
+# Install Claude Code for the claude user
+install_claude_code() {
+    info "Installing Claude Code for claude user..."
+
+    # Use the official installer, which installs to ~/.local/bin/claude
+    # The -H flag ensures HOME is set correctly
+    if sudo -H -u claude bash -c 'curl -fsSL https://claude.ai/install.sh | sh'; then
+        info "Claude Code installed successfully"
+        return 0
+    else
+        warn "Claude Code installation failed"
+        warn "You can install manually later: sudo -H -u claude -i"
+        warn "Then run: curl -fsSL https://claude.ai/install.sh | sh"
+        return 1
+    fi
 }
 
 # Print final instructions
 print_instructions() {
     local claude_home
+    local claude_installed=false
     if [[ "$PLATFORM" == "macos" ]]; then
         claude_home="/Users/claude"
     else
         claude_home="/home/claude"
+    fi
+
+    # Check if claude is available to the claude user
+    if sudo -H -u claude bash -c 'command -v claude' &>/dev/null; then
+        claude_installed=true
     fi
 
     echo ""
@@ -187,13 +214,29 @@ print_instructions() {
     echo ""
     echo "Next steps:"
     echo ""
-    echo "1. Authenticate Claude Code for the claude user:"
-    echo "   sudo -u claude -i claude"
-    echo ""
-    echo "   This will open Claude Code and prompt you to log in."
-    echo "   Complete the authentication, then exit with /exit or Ctrl+C."
-    echo ""
-    echo "2. Start using yoloclaude:"
+
+    if [[ "$claude_installed" == "true" ]]; then
+        echo "1. Authenticate Claude Code for the claude user:"
+        echo "   sudo -H -u claude -i claude"
+        echo ""
+        echo "   This will open Claude Code and prompt you to log in."
+        echo "   Complete the authentication, then exit with /exit or Ctrl+C."
+        echo ""
+        echo "2. Start using yoloclaude:"
+    else
+        echo "1. Install Claude Code for the claude user:"
+        echo "   sudo -H -u claude -i"
+        echo "   curl -fsSL https://claude.ai/install.sh | sh"
+        echo "   exit"
+        echo ""
+        echo "2. Authenticate Claude Code for the claude user:"
+        echo "   sudo -H -u claude -i claude"
+        echo ""
+        echo "   This will open Claude Code and prompt you to log in."
+        echo "   Complete the authentication, then exit with /exit or Ctrl+C."
+        echo ""
+        echo "3. Start using yoloclaude:"
+    fi
     echo "   yoloclaude https://github.com/user/repo"
     echo "   yoloclaude /path/to/local/repo"
     echo ""

@@ -723,9 +723,11 @@ def ensure_repo_accessible_to_claude(repo_path: Path) -> None:
         run_cmd(['chmod', '-R', 'o+rX', str(git_dir)])
 
     # Make the entire repo writable so claude can push and working tree can update
+    # Use g+w (group write) because claude is typically in the staff group,
+    # which is the group owner of user directories on macOS
     if needs_write_fix:
         info("Making repository writable (needed for push)...")
-        run_cmd(['chmod', '-R', 'o+w', str(repo_path)])
+        run_cmd(['chmod', '-R', 'g+w', str(repo_path)])
 
         # Configure repo to accept pushes to the current branch
         # This updates the working tree after a push, which is what we want

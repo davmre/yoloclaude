@@ -15,7 +15,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -1095,8 +1094,10 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
             # We use a bundle because direct fetch fails due to git's "dubious
             # ownership" check - the -c safe.directory option doesn't propagate
             # to the git-upload-pack subprocess that runs in the worktree
-            bundle_fd, bundle_path = tempfile.mkstemp(suffix='.bundle', prefix='yoloclaude-')
-            os.close(bundle_fd)
+            #
+            # Create the bundle inside the worktree (which claude owns) so
+            # claude can write to it, then the invoking user reads from it
+            bundle_path = str(claude_repo_path / '.yoloclaude-sync.bundle')
             try:
                 # Create bundle as claude (who owns the worktree)
                 info(f"Syncing changes to {origin_path}...")
@@ -1105,16 +1106,15 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
                     'bundle', 'create', bundle_path, branch
                 ])
                 # Make bundle readable by invoking user
-                os.chmod(bundle_path, 0o644)
+                run_as_claude(['chmod', '644', bundle_path])
                 # Fetch from bundle as invoking user (who owns origin)
                 run_cmd([
                     'git', '-C', str(origin_path),
                     'fetch', bundle_path, f'{branch}:{branch}'
                 ])
             finally:
-                # Clean up bundle
-                if os.path.exists(bundle_path):
-                    os.unlink(bundle_path)
+                # Clean up bundle (as claude, since claude owns it)
+                run_as_claude(['rm', '-f', bundle_path], check=False)
             info("Changes synced to your local repo.")
 
             # Check if local repo has a remote

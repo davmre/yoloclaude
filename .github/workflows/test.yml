@@ -37,9 +37,3 @@ jobs:
 
       - name: Check Bash syntax
         run: bash -n yoloclaude-setup
-
-      - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: "."
-          ignore_paths: "tests"

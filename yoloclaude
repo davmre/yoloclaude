@@ -1117,6 +1117,31 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
                 run_as_claude(['rm', '-f', bundle_path], check=False)
             info("Changes synced to your local repo.")
 
+            # Check if we can offer to merge into the current branch
+            current_branch_result = run_cmd(
+                ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture=True, check=False
+            )
+            if current_branch_result.returncode == 0:
+                current_branch = current_branch_result.stdout.strip()
+                if current_branch != 'HEAD' and current_branch != branch:
+                    # Check if fast-forward merge is possible
+                    # current_branch is ancestor of branch => can fast-forward
+                    ff_check = run_cmd(
+                        ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', current_branch, branch],
+                        check=False, capture=True
+                    )
+                    print()
+                    if ff_check.returncode == 0:
+                        # Fast-forward is possible
+                        if prompt_yes_no(f"Merge '{branch}' into '{current_branch}'? (fast-forward)"):
+                            run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
+                            info(f"Merged into {current_branch}.")
+                    else:
+                        # Can't fast-forward, inform user
+                        info(f"Branch '{branch}' can't be fast-forwarded into '{current_branch}'.")
+                        info(f"To merge manually: git merge {branch}")
+
             # Check if local repo has a remote
             result = run_cmd(
                 ['git', '-C', str(origin_path), 'remote', 'get-url', 'origin'],
@@ -1124,9 +1149,16 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
             )
             if result.returncode == 0 and result.stdout.strip():
                 print()
-                if prompt_yes_no("Push from your local repo to remote?"):
-                    run_cmd(['git', '-C', str(origin_path), 'push', 'origin', branch])
-                    info("Changes pushed to remote!")
+                if prompt_yes_no("Push to remote?"):
+                    # Push whatever branch is currently checked out
+                    current_branch_result = run_cmd(
+                        ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                        capture=True, check=False
+                    )
+                    if current_branch_result.returncode == 0:
+                        push_branch = current_branch_result.stdout.strip()
+                        run_cmd(['git', '-C', str(origin_path), 'push', 'origin', push_branch])
+                        info(f"Pushed {push_branch} to remote!")
     else:
         info("No unpushed commits.")
 

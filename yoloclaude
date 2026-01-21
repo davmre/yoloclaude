@@ -1312,6 +1312,16 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
     # Create worktree
     worktree_path = create_worktree(base_repo, origin_path, branch_name)
 
+    # Sync uncommitted changes from origin to worktree
+    # This ensures the worktree has the same working state as the origin,
+    # not just the same committed state
+    info("Syncing uncommitted changes from origin...")
+    run_as_claude([
+        'rsync', '-a', '--delete', '--exclude=.git',
+        str(origin_path) + '/',   # trailing slash = contents of directory
+        str(worktree_path) + '/'
+    ])
+
     # Import the Claude session
     imported_uuid = import_claude_session(origin_path, worktree_path, session_uuid)
 

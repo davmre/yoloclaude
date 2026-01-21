@@ -234,6 +234,7 @@ class Session:
         created_at: str,
         last_accessed: str,
         claude_session_id: Optional[str] = None,
+        source_branch: str = "main",
     ):
         self.session_id = session_id
         self.project_name = project_name
@@ -244,6 +245,7 @@ class Session:
         self.last_accessed = last_accessed
         # TODO: Populate this from Claude's output to enable --resume
         self.claude_session_id = claude_session_id
+        self.source_branch = source_branch
 
     def to_dict(self) -> dict:
         return {
@@ -255,12 +257,16 @@ class Session:
             "created_at": self.created_at,
             "last_accessed": self.last_accessed,
             "claude_session_id": self.claude_session_id,
+            "source_branch": self.source_branch,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Session':
         # Remove deprecated fields for backward compatibility
         data.pop("status", None)
+        # Default source_branch for old sessions
+        if "source_branch" not in data:
+            data["source_branch"] = "main"
         return cls(**data)
 
     def save(self) -> None:
@@ -433,6 +439,86 @@ def check_worktree_status(session: Session) -> str:
     return "clean"
 
 
+def get_origin_current_branch(origin_path: Path) -> str:
+    """Get the currently checked-out branch in the origin repo."""
+    result = run_cmd(
+        ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+        capture=True, check=False
+    )
+    if result.returncode == 0 and result.stdout.strip() != 'HEAD':
+        return result.stdout.strip()
+    return 'main'  # Fallback
+
+
+def list_origin_branches(origin_path: Path) -> list[str]:
+    """List branches available in origin repo."""
+    result = run_cmd(
+        ['git', '-C', str(origin_path), 'branch', '-r', '--format=%(refname:short)'],
+        capture=True, check=False
+    )
+    if result.returncode != 0:
+        return ['main']
+    branches = []
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('origin/') and not line.endswith('/HEAD'):
+            branches.append(line.replace('origin/', ''))
+    return branches or ['main']
+
+
+def prompt_source_branch(origin_path: Path) -> str:
+    """Prompt user to select which branch to base the worktree on."""
+    current = get_origin_current_branch(origin_path)
+    branches = list_origin_branches(origin_path)
+
+    if AUTO_YES:
+        info(f"Using branch: {current} [auto]")
+        return current
+
+    print()
+    info(f"Available branches: {', '.join(branches[:5])}" +
+         (f" (+{len(branches)-5} more)" if len(branches) > 5 else ""))
+    branch = prompt(f"Base worktree on which branch? [{current}]")
+    return branch.strip() if branch.strip() else current
+
+
+def get_worktree_origin_status(session: Session) -> dict:
+    """Get worktree status relative to its source branch."""
+    worktree_path = Path(session.worktree_path)
+    source_branch = session.source_branch
+
+    if not path_exists_as_claude(worktree_path):
+        return {'behind': 0, 'ahead': 0, 'can_ff': False, 'error': 'missing'}
+
+    # Fetch origin
+    run_as_claude(['git', '-C', str(worktree_path), 'fetch', 'origin'], check=False, capture=True)
+
+    upstream = f'origin/{source_branch}'
+
+    # Verify upstream exists
+    check = run_as_claude(
+        ['git', '-C', str(worktree_path), 'rev-parse', '--verify', upstream],
+        capture=True, check=False
+    )
+    if check.returncode != 0:
+        return {'behind': 0, 'ahead': 0, 'can_ff': False, 'error': f'{source_branch} not found'}
+
+    # Get ahead/behind counts
+    result = run_as_claude(
+        ['git', '-C', str(worktree_path), 'rev-list', '--left-right', '--count', f'{upstream}...HEAD'],
+        capture=True, check=False
+    )
+    if result.returncode != 0:
+        return {'behind': 0, 'ahead': 0, 'can_ff': False, 'error': 'comparison failed'}
+
+    parts = result.stdout.strip().split()
+    behind = int(parts[0]) if parts else 0
+    ahead = int(parts[1]) if len(parts) >= 2 else 0
+    can_ff = behind > 0 and ahead == 0
+
+    return {'behind': behind, 'ahead': ahead, 'can_ff': can_ff, 'error': None}
+
+
 def display_worktrees(sessions: list[Session]) -> None:
     """Display worktrees in a table format with status."""
     if not sessions:
@@ -440,26 +526,43 @@ def display_worktrees(sessions: list[Session]) -> None:
         return
 
     print()
-    print(f"{'#':<4} {'Worktree Name':<40} {'Last Accessed':<20} {'Status':<10}")
-    print("-" * 75)
+    print(f"{'#':<3} {'Worktree Name':<32} {'Base':<12} {'Status':<10} {'vs Origin':<18}")
+    print("-" * 78)
 
     for i, session in enumerate(sessions, 1):
         worktree_name = get_worktree_name(session)
-        # Truncate if too long
-        if len(worktree_name) > 38:
-            worktree_name = worktree_name[:35] + "..."
-        last_accessed = session.last_accessed[:19]  # Just datetime part
+        if len(worktree_name) > 30:
+            worktree_name = worktree_name[:27] + "..."
+
+        base_branch = session.source_branch
+        if len(base_branch) > 10:
+            base_branch = base_branch[:7] + "..."
+
         status = check_worktree_status(session)
+        status_str = {
+            "clean": f"{Colors.GREEN}clean{Colors.NC}",
+            "modified": f"{Colors.YELLOW}modified{Colors.NC}",
+            "missing": f"{Colors.RED}missing{Colors.NC}",
+        }.get(status, status)
 
-        # Color-code status
-        if status == "clean":
-            status_str = f"{Colors.GREEN}{status}{Colors.NC}"
-        elif status == "modified":
-            status_str = f"{Colors.YELLOW}{status}{Colors.NC}"
-        else:  # missing
-            status_str = f"{Colors.RED}{status}{Colors.NC}"
+        # Get origin status
+        if status != "missing":
+            origin = get_worktree_origin_status(session)
+            if origin.get('error'):
+                origin_str = f"({origin['error']})"
+            elif origin['behind'] == 0 and origin['ahead'] == 0:
+                origin_str = f"{Colors.GREEN}up-to-date{Colors.NC}"
+            else:
+                parts = []
+                if origin['behind'] > 0:
+                    parts.append(f"{Colors.YELLOW}{origin['behind']} behind{Colors.NC}")
+                if origin['ahead'] > 0:
+                    parts.append(f"{Colors.CYAN}{origin['ahead']} ahead{Colors.NC}")
+                origin_str = ", ".join(parts)
+        else:
+            origin_str = ""
 
-        print(f"{i:<4} {worktree_name:<40} {last_accessed:<20} {status_str:<10}")
+        print(f"{i:<3} {worktree_name:<32} {base_branch:<12} {status_str:<10} {origin_str}")
 
     print()
 
@@ -767,7 +870,7 @@ def ensure_claude_clone(origin_path: Path) -> Path:
     return claude_repo_path
 
 
-def create_worktree(base_repo: Path, origin_path: Path, branch_name: str) -> Path:
+def create_worktree(base_repo: Path, origin_path: Path, branch_name: str, source_branch: str) -> Path:
     """
     Create a git worktree for a new session.
     Returns the path to the worktree.
@@ -782,25 +885,14 @@ def create_worktree(base_repo: Path, origin_path: Path, branch_name: str) -> Pat
     info("Fetching latest from origin...")
     run_as_claude(['git', '-C', str(base_repo), 'fetch', 'origin'])
 
-    # Get the default branch from origin
-    result = run_as_claude(
-        ['git', '-C', str(base_repo), 'symbolic-ref', 'refs/remotes/origin/HEAD'],
-        capture=True, check=False
-    )
-    if result.returncode == 0:
-        default_branch = result.stdout.strip().split('/')[-1]
-    else:
-        # Fallback to main or master
-        default_branch = 'main'
-
-    # Create the worktree with a new branch based on origin's default
-    info(f"Creating worktree for branch '{branch_name}'...")
+    # Create the worktree with a new branch based on specified source branch
+    info(f"Creating worktree for branch '{branch_name}' (based on {source_branch})...")
     run_as_claude([
         'git', '-C', str(base_repo),
         'worktree', 'add',
         '-b', branch_name,
         str(worktree_path),
-        f'origin/{default_branch}'
+        f'origin/{source_branch}'
     ])
 
     return worktree_path
@@ -836,11 +928,14 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
     # Ensure base clone exists
     base_repo = ensure_claude_clone(origin_path)
 
+    # Prompt for source branch
+    source_branch = prompt_source_branch(origin_path)
+
     # Get branch name from user
     branch_name = prompt_branch_name(project_name)
 
-    # Create worktree
-    worktree_path = create_worktree(base_repo, origin_path, branch_name)
+    # Create worktree based on source branch
+    worktree_path = create_worktree(base_repo, origin_path, branch_name, source_branch)
 
     # Create session record
     session_id = generate_session_id()
@@ -853,6 +948,7 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
         origin_path=str(origin_path),
         created_at=now,
         last_accessed=now,
+        source_branch=source_branch,
     )
     session.save()
 
@@ -865,7 +961,7 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
         exit_code = run_claude_session(worktree_path, claude_args, session)
 
     # Handle end of session
-    handle_end_of_session(worktree_path, origin_path)
+    handle_end_of_session(worktree_path, origin_path, session)
 
     return session, exit_code
 
@@ -885,13 +981,36 @@ def resume_session(session: Session, claude_args: list[str], shell_mode: bool = 
     # Ensure origin is still accessible
     ensure_repo_accessible_to_claude(origin_path)
 
+    # Check origin status and offer fast-forward
+    origin_status = get_worktree_origin_status(session)
+
+    if origin_status.get('error'):
+        warn(f"Could not check origin status: {origin_status['error']}")
+    elif origin_status['behind'] > 0 and origin_status['ahead'] > 0:
+        warn(f"Worktree has diverged from {session.source_branch} "
+             f"({origin_status['behind']} behind, {origin_status['ahead']} ahead)")
+    elif origin_status.get('can_ff'):
+        if check_worktree_status(session) == "modified":
+            warn("Worktree has uncommitted changes. Skipping fast-forward.")
+        else:
+            info(f"Worktree is {origin_status['behind']} commit(s) behind {session.source_branch}.")
+            if prompt_yes_no("Fast-forward to latest?"):
+                result = run_as_claude(
+                    ['git', '-C', str(worktree_path), 'merge', '--ff-only', f'origin/{session.source_branch}'],
+                    capture=True, check=False
+                )
+                if result.returncode == 0:
+                    info("Fast-forwarded to latest.")
+                else:
+                    warn(f"Fast-forward failed: {result.stderr.strip()}")
+
     # Update last accessed
     session.last_accessed = datetime.now().isoformat()
     session.save()
 
     info(f"Resuming session: {session.session_id}")
     info(f"Project: {session.project_name}")
-    info(f"Branch: {session.branch}")
+    info(f"Branch: {session.branch} (based on {session.source_branch})")
 
     # Run Claude Code or shell
     if shell_mode:
@@ -903,7 +1022,7 @@ def resume_session(session: Session, claude_args: list[str], shell_mode: bool = 
         exit_code = run_claude_session(worktree_path, claude_args, session)
 
     # Handle end of session
-    handle_end_of_session(worktree_path, origin_path)
+    handle_end_of_session(worktree_path, origin_path, session)
 
     return exit_code
 
@@ -1075,10 +1194,12 @@ def run_shell_session(project_path: Path) -> int:
     return result.returncode
 
 
-def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
+def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Session) -> None:
     """Handle git sync at end of session."""
     print()
     info("Session ended. Checking for changes...")
+
+    source_branch = session.source_branch
 
     # Check for uncommitted changes
     result = run_as_claude(
@@ -1097,24 +1218,13 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
         check=False, capture=True
     )
 
-    # Check for unpushed commits
+    # Check for unpushed commits relative to source branch
     result = run_as_claude(
-        ['git', '-C', str(claude_repo_path), 'log', '--oneline', 'origin/HEAD..HEAD'],
+        ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'origin/{source_branch}..HEAD'],
         capture=True, check=False
     )
 
     unpushed_commits = result.stdout.strip() if result.returncode == 0 else ""
-
-    if not unpushed_commits:
-        # Try with origin/main or origin/master
-        for branch in ['origin/main', 'origin/master']:
-            result = run_as_claude(
-                ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'{branch}..HEAD'],
-                capture=True, check=False
-            )
-            if result.returncode == 0:
-                unpushed_commits = result.stdout.strip()
-                break
 
     if unpushed_commits:
         print()
@@ -1160,30 +1270,26 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
                 run_as_claude(['rm', '-f', bundle_path], check=False)
             info("Changes synced to your local repo.")
 
-            # Check if we can offer to merge into the current branch
-            current_branch_result = run_cmd(
-                ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
-                capture=True, check=False
-            )
-            if current_branch_result.returncode == 0:
-                current_branch = current_branch_result.stdout.strip()
-                if current_branch != 'HEAD' and current_branch != branch:
-                    # Check if fast-forward merge is possible
-                    # current_branch is ancestor of branch => can fast-forward
-                    ff_check = run_cmd(
-                        ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', current_branch, branch],
-                        check=False, capture=True
-                    )
-                    print()
-                    if ff_check.returncode == 0:
-                        # Fast-forward is possible
-                        if prompt_yes_no(f"Merge '{branch}' into '{current_branch}'? (fast-forward)"):
-                            run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
-                            info(f"Merged into {current_branch}.")
-                    else:
-                        # Can't fast-forward, inform user
-                        info(f"Branch '{branch}' can't be fast-forwarded into '{current_branch}'.")
-                        info(f"To merge manually: git merge {branch}")
+            # Check if source branch is checked out in origin - offer merge
+            current_in_origin = get_origin_current_branch(origin_path)
+
+            if current_in_origin == source_branch:
+                # Source branch is checked out - can offer merge
+                ff_check = run_cmd(
+                    ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', source_branch, branch],
+                    check=False, capture=True
+                )
+                print()
+                if ff_check.returncode == 0:
+                    if prompt_yes_no(f"Merge '{branch}' into '{source_branch}'? (fast-forward)"):
+                        run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
+                        info(f"Merged into {source_branch}.")
+                else:
+                    info(f"Branch '{branch}' can't be fast-forwarded into '{source_branch}'.")
+                    info(f"To merge manually: git checkout {source_branch} && git merge {branch}")
+            else:
+                info(f"Source branch '{source_branch}' is not checked out in origin.")
+                info(f"To merge: git checkout {source_branch} && git merge {branch}")
 
             # Check if local repo has a remote
             result = run_cmd(
@@ -1395,11 +1501,15 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
     ensure_repo_accessible_to_claude(origin_path)
     base_repo = ensure_claude_clone(origin_path)
 
+    # Auto-detect source branch (don't prompt since we're rsyncing current state)
+    source_branch = get_origin_current_branch(origin_path)
+    info(f"Using current branch: {source_branch}")
+
     # Get branch name
     branch_name = prompt_branch_name(project_name)
 
-    # Create worktree
-    worktree_path = create_worktree(base_repo, origin_path, branch_name)
+    # Create worktree based on source branch
+    worktree_path = create_worktree(base_repo, origin_path, branch_name, source_branch)
 
     # Sync uncommitted changes from origin to worktree
     # This ensures the worktree has the same working state as the origin,
@@ -1427,6 +1537,7 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
             origin_path=str(origin_path),
             created_at=now,
             last_accessed=now,
+            source_branch=source_branch,
         )
         session.save()
         exit_code = run_claude_session(worktree_path, claude_args, session)
@@ -1445,6 +1556,7 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
             created_at=now,
             last_accessed=now,
             claude_session_id=imported_uuid,
+            source_branch=source_branch,
         )
         session.save()
 
@@ -1455,7 +1567,7 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
         exit_code = run_claude_session(worktree_path, import_args, session)
 
     # Handle end of session
-    handle_end_of_session(worktree_path, origin_path)
+    handle_end_of_session(worktree_path, origin_path, session)
 
     return exit_code
 

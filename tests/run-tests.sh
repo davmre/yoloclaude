@@ -522,6 +522,202 @@ test_project_memory() {
 }
 
 # ============================================================================
+# Test: Create worktree on feature branch
+# ============================================================================
+test_feature_branch_worktree() {
+    log_test "Testing worktree creation on feature branch..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
+
+    # Create a feature branch in user's repo
+    cd "$USER_REPO"
+    git checkout -b feature-test
+    echo "feature content" > feature.txt
+    git add .
+    git commit -m "Feature commit"
+    git push -u origin feature-test
+
+    # Create worktree (--yes should use current branch: feature-test)
+    cd /home/testuser
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Get the session and verify source_branch
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    SOURCE_BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('source_branch', 'MISSING'))")
+
+    if [[ "$SOURCE_BRANCH" == "feature-test" ]]; then
+        log_pass "Worktree created with source_branch=feature-test"
+    else
+        log_fail "Expected source_branch=feature-test, got $SOURCE_BRANCH"
+        return 1
+    fi
+
+    # Verify worktree is based on feature-test (has feature.txt)
+    WORKTREE_PATH=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | tail -1)
+    if sudo -u claude test -f "$WORKTREE_PATH/feature.txt"; then
+        log_pass "Worktree contains feature branch content"
+    else
+        log_fail "Worktree missing feature branch content"
+        return 1
+    fi
+
+    # Cleanup: switch back to main
+    cd "$USER_REPO"
+    git checkout main
+}
+
+# ============================================================================
+# Test: Display shows base branch and origin status
+# ============================================================================
+test_display_origin_status() {
+    log_test "Testing worktree display shows base branch and origin status..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    # Should show Base column header
+    if echo "$OUTPUT" | grep -q "Base"; then
+        log_pass "Display shows Base column"
+    else
+        log_fail "Display missing Base column"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Should show origin status column
+    if echo "$OUTPUT" | grep -q "Origin\|vs Origin"; then
+        log_pass "Display shows Origin status column"
+    else
+        log_fail "Display missing Origin status column"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Should show "up-to-date" or behind/ahead
+    if echo "$OUTPUT" | grep -qE "(up-to-date|behind|ahead)"; then
+        log_pass "Display shows origin comparison status"
+    else
+        log_fail "Display missing origin comparison status"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Behind status when origin has new commits
+# ============================================================================
+test_behind_status() {
+    log_test "Testing behind status when origin has new commits..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
+
+    # Ensure we're on main and create a worktree
+    cd "$USER_REPO"
+    git checkout main
+    cd /home/testuser
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Add a commit to origin AFTER the worktree was created
+    cd "$USER_REPO"
+    echo "new content from origin" >> file.txt
+    git add .
+    git commit -m "Commit after worktree created"
+
+    # List worktrees - should show "behind"
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    if echo "$OUTPUT" | grep -q "behind"; then
+        log_pass "Worktree shows 'behind' status"
+    else
+        log_fail "Worktree should show 'behind' status"
+        echo "$OUTPUT"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Fast-forward on resume
+# ============================================================================
+test_fast_forward_resume() {
+    log_test "Testing fast-forward on resume..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
+
+    # Get the most recent session
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['branch'])")
+    WORKTREE_NAME=${BRANCH#claude/}
+    # The worktree directory uses the full branch name with / replaced by -
+    WORKTREE_PATH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['worktree_path'])")
+
+    # Get commit count before fast-forward
+    BEFORE_COUNT=$(sudo -u claude git -C "$WORKTREE_PATH" rev-list --count HEAD)
+
+    # The origin already has a new commit from test_behind_status
+    # Resume with --yes (should auto-fast-forward)
+    cd /home/testuser
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project -w "$WORKTREE_NAME" || true
+
+    # Get commit count after
+    AFTER_COUNT=$(sudo -u claude git -C "$WORKTREE_PATH" rev-list --count HEAD)
+
+    if [[ "$AFTER_COUNT" -gt "$BEFORE_COUNT" ]]; then
+        log_pass "Fast-forward applied on resume ($BEFORE_COUNT -> $AFTER_COUNT commits)"
+    else
+        log_fail "Fast-forward not applied (before: $BEFORE_COUNT, after: $AFTER_COUNT)"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Backward compatibility (old sessions without source_branch)
+# ============================================================================
+test_backward_compat_source_branch() {
+    log_test "Testing backward compatibility for sessions without source_branch..."
+
+    # Create a session file without source_branch field (simulates old session)
+    OLD_SESSION_ID="test-old-session-$$"
+    OLD_SESSION_FILE="/home/testuser/.yoloclaude/sessions/${OLD_SESSION_ID}.json"
+
+    # Get an existing worktree path to use
+    BASE_CLONE="/home/claude/projects/test-project"
+    WORKTREE_PATH=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    WORKTREE_NAME=$(basename "$WORKTREE_PATH")
+
+    cat > "$OLD_SESSION_FILE" << EOF
+{
+  "session_id": "$OLD_SESSION_ID",
+  "project_name": "test-project",
+  "branch": "claude/$WORKTREE_NAME",
+  "worktree_path": "$WORKTREE_PATH",
+  "origin_path": "/home/testuser/repos/test-project",
+  "created_at": "2026-01-01T00:00:00",
+  "last_accessed": "2026-01-01T00:00:00"
+}
+EOF
+
+    # List worktrees - should work and show "main" as default source_branch
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    if echo "$OUTPUT" | grep -q "main"; then
+        log_pass "Old session defaults to main branch"
+    else
+        log_fail "Old session should default to main branch"
+        echo "$OUTPUT"
+        return 1
+    fi
+
+    # Cleanup
+    rm -f "$OLD_SESSION_FILE"
+}
+
+# ============================================================================
 # Test: Help output
 # ============================================================================
 test_help() {
@@ -590,6 +786,13 @@ main() {
     test_clear_worktree
     test_clear_all_worktrees
     test_project_memory
+
+    # Multi-branch workflow tests
+    test_feature_branch_worktree
+    test_display_origin_status
+    test_behind_status
+    test_fast_forward_resume
+    test_backward_compat_source_branch
 
     test_missing_repo
 

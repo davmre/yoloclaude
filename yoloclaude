@@ -132,7 +132,6 @@ class Session:
         created_at: str,
         last_accessed: str,
         claude_session_id: Optional[str] = None,
-        status: str = "active"
     ):
         self.session_id = session_id
         self.project_name = project_name
@@ -141,8 +140,8 @@ class Session:
         self.origin_path = origin_path
         self.created_at = created_at
         self.last_accessed = last_accessed
+        # TODO: Populate this from Claude's output to enable --resume
         self.claude_session_id = claude_session_id
-        self.status = status
 
     def to_dict(self) -> dict:
         return {
@@ -154,11 +153,12 @@ class Session:
             "created_at": self.created_at,
             "last_accessed": self.last_accessed,
             "claude_session_id": self.claude_session_id,
-            "status": self.status,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Session':
+        # Remove deprecated fields for backward compatibility
+        data.pop("status", None)
         return cls(**data)
 
     def save(self) -> None:
@@ -303,14 +303,6 @@ def resolve_project_name(name: str) -> Optional[Path]:
             return origin_path
 
     return None
-
-
-def extract_project_name(repo: str) -> str:
-    """
-    Extract project name from repo argument.
-    This is the basename of the repo path/URL without .git suffix.
-    """
-    return extract_repo_name(repo)
 
 
 def check_worktree_status(session: Session) -> str:
@@ -776,7 +768,6 @@ def start_new_session(origin_path: Path, claude_args: list[str]) -> tuple[Sessio
         origin_path=str(origin_path),
         created_at=now,
         last_accessed=now,
-        status="active"
     )
     session.save()
 
@@ -1024,6 +1015,153 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
         info("No unpushed commits.")
 
 
+# =============================================================================
+# Repo Resolution
+# =============================================================================
+
+def resolve_repo_path(repo: str) -> Path:
+    """
+    Resolve a repo argument to a local path.
+
+    Handles:
+    - Git URLs (clones to ~/repos/ first)
+    - Local directory paths
+    - Project names in ~/repos/
+    - Project names from previous sessions (memory feature)
+
+    Returns the resolved Path or exits with error.
+    """
+    repos_dir = get_user_repos_dir()
+
+    if is_git_url(repo):
+        # Remote URL - clone to user's repos dir first
+        return ensure_user_repo(repo, repos_dir)
+
+    if os.path.isdir(repo):
+        # Local directory path
+        path = Path(repo).resolve()
+        if not (path / '.git').exists():
+            error(f"{path} is not a git repository")
+        return path
+
+    if os.path.isdir(repos_dir / repo):
+        # Project name that exists in repos dir
+        path = repos_dir / repo
+        if not (path / '.git').exists():
+            error(f"{path} is not a git repository")
+        return path
+
+    # Try to resolve via "memory" feature (previous sessions)
+    resolved = resolve_project_name(repo)
+    if resolved:
+        info(f"Resolved '{repo}' from previous session")
+        return resolved
+
+    error(
+        f"Cannot find repository: {repo}\n"
+        "Provide a git URL, local path, or existing project name in ~/repos/"
+    )
+
+
+# =============================================================================
+# CLI Command Handlers
+# =============================================================================
+
+def cmd_list_sessions() -> None:
+    """Handle --list command."""
+    sessions = list_sessions()
+    display_sessions(sessions)
+
+
+def cmd_list_worktrees(project_name: str) -> None:
+    """Handle --list-worktrees command."""
+    sessions = list_sessions(project_filter=project_name)
+    if not sessions:
+        info(f"No worktrees found for project '{project_name}'.")
+    else:
+        info(f"Worktrees for project '{project_name}':")
+        display_worktrees(sessions)
+
+
+def cmd_clear_worktree(project_name: str, worktree_name: str) -> None:
+    """Handle --clear-worktree command."""
+    session = find_session_by_worktree(project_name, worktree_name)
+    if not session:
+        error(f"Worktree '{worktree_name}' not found for project '{project_name}'")
+    remove_worktree(session)
+
+
+def cmd_clear_worktrees(project_name: str) -> None:
+    """Handle --clear-worktrees command."""
+    remove_all_worktrees(project_name)
+
+
+def cmd_resume(session_id: Optional[str], claude_args: list[str]) -> int:
+    """
+    Handle --resume command.
+    Returns exit code from Claude.
+    """
+    if session_id is None:
+        # Show list and let user pick
+        sessions = list_sessions()
+        if not sessions:
+            error("No sessions to resume. Start a new session first.")
+
+        display_sessions(sessions)
+
+        if AUTO_YES:
+            session = sessions[0]
+            info(f"Auto-resuming most recent session: {session.session_id}")
+        else:
+            user_input = prompt("Enter session ID to resume (or press Enter for most recent)")
+            if user_input.strip():
+                session = find_session(user_input.strip())
+                if not session:
+                    error(f"Session not found: {user_input}")
+            else:
+                session = sessions[0]
+    else:
+        session = find_session(session_id)
+        if not session:
+            error(f"Session not found: {session_id}")
+
+    return resume_session(session, claude_args)
+
+
+def cmd_worktree_resume(project_name: str, worktree_name: str, claude_args: list[str]) -> int:
+    """
+    Handle -w/--worktree command.
+    Returns exit code from Claude.
+    """
+    session = find_session_by_worktree(project_name, worktree_name)
+    if not session:
+        error(f"Worktree '{worktree_name}' not found for project '{project_name}'")
+    return resume_session(session, claude_args)
+
+
+def cmd_start_session(origin_path: Path, claude_args: list[str]) -> int:
+    """
+    Start a new session or prompt to resume existing.
+    Returns exit code from Claude.
+    """
+    project_name = origin_path.name
+
+    # Check for existing worktrees and prompt user
+    existing_sessions = list_sessions(project_filter=project_name)
+    if existing_sessions:
+        selected_session = prompt_worktree_choice(existing_sessions)
+        if selected_session:
+            return resume_session(selected_session, claude_args)
+
+    # Start new session with worktree
+    _, exit_code = start_new_session(origin_path, claude_args)
+    return exit_code
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description='Run Claude Code in a sandboxed user environment',
@@ -1108,135 +1246,53 @@ Examples:
 
     # Handle --list
     if args.list:
-        sessions = list_sessions()
-        display_sessions(sessions)
+        cmd_list_sessions()
         sys.exit(0)
 
     # Handle --list-worktrees (requires a project name)
     if args.list_worktrees:
         if not args.repo:
             error("--list-worktrees requires a project name")
-        project_name = extract_project_name(args.repo)
-        sessions = list_sessions(project_filter=project_name)
-        if not sessions:
-            info(f"No worktrees found for project '{project_name}'.")
-        else:
-            info(f"Worktrees for project '{project_name}':")
-            display_worktrees(sessions)
+        cmd_list_worktrees(extract_repo_name(args.repo))
         sys.exit(0)
 
     # Handle --clear-worktree (requires a project name)
     if args.clear_worktree:
         if not args.repo:
             error("--clear-worktree requires a project name")
-        project_name = extract_project_name(args.repo)
-        session = find_session_by_worktree(project_name, args.clear_worktree)
-        if not session:
-            error(f"Worktree '{args.clear_worktree}' not found for project '{project_name}'")
-        remove_worktree(session)
+        cmd_clear_worktree(extract_repo_name(args.repo), args.clear_worktree)
         sys.exit(0)
 
     # Handle --clear-worktrees (requires a project name)
     if args.clear_worktrees:
         if not args.repo:
             error("--clear-worktrees requires a project name")
-        project_name = extract_project_name(args.repo)
-        remove_all_worktrees(project_name)
+        cmd_clear_worktrees(extract_repo_name(args.repo))
         sys.exit(0)
 
     # Handle --resume
     if args.resume is not None:
-        if args.resume == '__list__':
-            # Show list and let user pick
-            sessions = list_sessions()
-            if not sessions:
-                error("No sessions to resume. Start a new session first.")
-
-            display_sessions(sessions)
-
-            if AUTO_YES:
-                # In auto mode, resume the most recent session
-                session = sessions[0]
-                info(f"Auto-resuming most recent session: {session.session_id}")
-            else:
-                session_id = prompt("Enter session ID to resume (or press Enter for most recent)")
-                if session_id.strip():
-                    session = find_session(session_id.strip())
-                    if not session:
-                        error(f"Session not found: {session_id}")
-                else:
-                    session = sessions[0]
-        else:
-            # Resume specific session
-            session = find_session(args.resume)
-            if not session:
-                error(f"Session not found: {args.resume}")
-
-        exit_code = resume_session(session, args.claude_args)
+        session_id = None if args.resume == '__list__' else args.resume
+        exit_code = cmd_resume(session_id, args.claude_args)
         sys.exit(exit_code)
 
-    # New session - need a repo
+    # Commands below require a repo argument
     if not args.repo:
         parser.print_help()
         print()
         error("Please provide a repository, or use --resume to continue a previous session.")
 
-    repos_dir = get_user_repos_dir()
-
-    # Determine the origin path (invoking user's local repo)
-    repo = args.repo
-
-    if is_git_url(repo):
-        # Remote URL - clone to user's repos dir first
-        origin_path = ensure_user_repo(repo, repos_dir)
-    elif os.path.isdir(repo):
-        # Local directory path
-        origin_path = Path(repo).resolve()
-        if not (origin_path / '.git').exists():
-            error(f"{origin_path} is not a git repository")
-    elif os.path.isdir(repos_dir / repo):
-        # Project name that exists in repos dir
-        origin_path = repos_dir / repo
-        if not (origin_path / '.git').exists():
-            error(f"{origin_path} is not a git repository")
-    else:
-        # Try to resolve via "memory" feature (previous sessions)
-        resolved_path = resolve_project_name(repo)
-        if resolved_path:
-            origin_path = resolved_path
-            info(f"Resolved '{repo}' from previous session")
-        else:
-            error(
-                f"Cannot find repository: {repo}\n"
-                "Provide a git URL, local path, or existing project name in ~/repos/"
-            )
-
+    # Resolve repo to local path
+    origin_path = resolve_repo_path(args.repo)
     info(f"Origin (your local repo): {origin_path}")
-
-    # Get project name for worktree operations
-    project_name = origin_path.name
 
     # Handle --worktree: resume a specific worktree
     if args.worktree:
-        session = find_session_by_worktree(project_name, args.worktree)
-        if not session:
-            error(f"Worktree '{args.worktree}' not found for project '{project_name}'")
-        exit_code = resume_session(session, args.claude_args)
+        exit_code = cmd_worktree_resume(origin_path.name, args.worktree, args.claude_args)
         sys.exit(exit_code)
 
-    # Check for existing worktrees and prompt user
-    existing_sessions = list_sessions(project_filter=project_name)
-    if existing_sessions:
-        selected_session = prompt_worktree_choice(existing_sessions)
-        if selected_session:
-            # User chose to resume an existing worktree
-            exit_code = resume_session(selected_session, args.claude_args)
-            sys.exit(exit_code)
-        # Otherwise, continue to create a new worktree
-
-    # Start new session with worktree
-    session, exit_code = start_new_session(origin_path, args.claude_args)
-
+    # Start session (prompts if existing worktrees)
+    exit_code = cmd_start_session(origin_path, args.claude_args)
     sys.exit(exit_code)
 
 

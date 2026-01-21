@@ -158,6 +158,25 @@ create_directories() {
     info "Created $claude_home/projects and $claude_home/.yoloclaude"
 }
 
+# Set up shared temp directory for Claude Code scratchpad
+setup_shared_temp() {
+    info "Setting up shared temp directory for Claude Code..."
+
+    local tmp_dir
+    if [[ "$PLATFORM" == "macos" ]]; then
+        tmp_dir="/private/tmp/claude"
+    else
+        tmp_dir="/tmp/claude"
+    fi
+
+    # Create directory with sticky bit (like /tmp itself)
+    # This allows multiple users to run Claude Code without conflicts
+    mkdir -p "$tmp_dir"
+    chmod 1777 "$tmp_dir"
+
+    info "Created $tmp_dir with sticky bit (mode 1777)"
+}
+
 # Configure sudo rules
 configure_sudo() {
     info "Configuring sudo rules..."
@@ -321,6 +340,7 @@ main() {
     fi
 
     create_directories
+    setup_shared_temp
     configure_sudo
     setup_git_config
     install_claude_code || true  # Don't fail if install fails - user can install manually

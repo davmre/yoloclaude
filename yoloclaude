@@ -826,10 +826,10 @@ def prompt_branch_name(project_name: str) -> str:
     return default_name
 
 
-def start_new_session(origin_path: Path, claude_args: list[str]) -> tuple[Session, int]:
+def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: bool = False) -> tuple[Session, int]:
     """
     Start a new yoloclaude session with a fresh worktree.
-    Returns the session and the exit code from Claude.
+    Returns the session and the exit code.
     """
     project_name = origin_path.name
 
@@ -858,8 +858,11 @@ def start_new_session(origin_path: Path, claude_args: list[str]) -> tuple[Sessio
 
     info(f"Session ID: {session_id}")
 
-    # Run Claude Code
-    exit_code = run_claude_session(worktree_path, claude_args, session)
+    # Run Claude Code or shell
+    if shell_mode:
+        exit_code = run_shell_session(worktree_path)
+    else:
+        exit_code = run_claude_session(worktree_path, claude_args, session)
 
     # Handle end of session
     handle_end_of_session(worktree_path, origin_path)
@@ -867,10 +870,10 @@ def start_new_session(origin_path: Path, claude_args: list[str]) -> tuple[Sessio
     return session, exit_code
 
 
-def resume_session(session: Session, claude_args: list[str]) -> int:
+def resume_session(session: Session, claude_args: list[str], shell_mode: bool = False) -> int:
     """
     Resume an existing session.
-    Returns the exit code from Claude.
+    Returns the exit code.
     """
     worktree_path = Path(session.worktree_path)
     origin_path = Path(session.origin_path)
@@ -890,11 +893,14 @@ def resume_session(session: Session, claude_args: list[str]) -> int:
     info(f"Project: {session.project_name}")
     info(f"Branch: {session.branch}")
 
-    # Run Claude Code with --resume if we have a claude session ID
-    if session.claude_session_id:
-        claude_args = ['--resume', session.claude_session_id] + list(claude_args)
-
-    exit_code = run_claude_session(worktree_path, claude_args, session)
+    # Run Claude Code or shell
+    if shell_mode:
+        exit_code = run_shell_session(worktree_path)
+    else:
+        # Run Claude Code with --resume if we have a claude session ID
+        if session.claude_session_id:
+            claude_args = ['--resume', session.claude_session_id] + list(claude_args)
+        exit_code = run_claude_session(worktree_path, claude_args, session)
 
     # Handle end of session
     handle_end_of_session(worktree_path, origin_path)
@@ -998,6 +1004,30 @@ def fix_feature_flags(claude_home: Path) -> None:
         warn(f"Failed to update Claude config: {result.stderr}")
 
 
+def prepare_sandbox_environment() -> str:
+    """
+    Prepare the sandbox environment for running commands as claude user.
+    Returns a shell command preamble that sets up PATH, keychain, etc.
+
+    This is used both for Claude Code sessions and shell sessions,
+    so that users can run `claude` manually from shell mode.
+    """
+    claude_home = get_claude_home()
+    clean_path = f"{claude_home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # Fix feature flags that cause hanging when enabled
+    fix_feature_flags(claude_home)
+
+    preamble = f'export PATH={shlex.quote(clean_path)}'
+
+    # On macOS, unlock the keychain
+    if sys.platform == "darwin":
+        keychain_path = f"{claude_home}/Library/Keychains/login.keychain-db"
+        preamble = f'security unlock-keychain -p "claude" {shlex.quote(keychain_path)} 2>/dev/null || true; {preamble}'
+
+    return preamble
+
+
 def run_claude_session(project_path: Path, claude_args: list[str], session: Optional[Session] = None) -> int:
     """
     Run Claude Code as the claude user in the project directory.
@@ -1007,36 +1037,40 @@ def run_claude_session(project_path: Path, claude_args: list[str], session: Opti
     info("Running as user: claude")
     print()
 
-    # Get the full path to claude binary (avoids PATH inheritance issues on macOS)
+    preamble = prepare_sandbox_environment()
     claude_bin = get_claude_binary_path()
-
-    # Build the command with a clean PATH
-    # We explicitly set PATH to avoid inheriting the invoking user's PATH,
-    # which may contain their own Claude Code installation
-    claude_home = get_claude_home()
-    clean_path = f"{claude_home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-    # On macOS, unlock the keychain before running claude
-    # The keychain may have auto-locked, which causes claude to hang when accessing credentials
-    keychain_unlock = ""
-    if sys.platform == "darwin":
-        keychain_path = f"{claude_home}/Library/Keychains/login.keychain-db"
-        keychain_unlock = f'security unlock-keychain -p "claude" {shlex.quote(keychain_path)} 2>/dev/null || true; '
-
-    # Fix feature flags that cause hanging when enabled
-    # These flags (tengu_mcp_tool_search, tengu_scratch) enable features that don't work
-    # properly when running as a sandboxed user, causing Claude to hang on startup
-    fix_feature_flags(claude_home)
 
     args_str = " ".join(shlex.quote(arg) for arg in claude_args)
     cmd = [
         'sudo', '-H', '-u', 'claude',
         'bash', '-c',
-        f'{keychain_unlock}export PATH={shlex.quote(clean_path)} && cd {shlex.quote(str(project_path))} && {shlex.quote(claude_bin)} --dangerously-skip-permissions {args_str}'
+        f'{preamble} && cd {shlex.quote(str(project_path))} && {shlex.quote(claude_bin)} --dangerously-skip-permissions {args_str}'
     ]
 
     # Run from /tmp to avoid Claude Code picking up .claude settings from the
     # invoking directory (which claude user may not have access to)
+    result = subprocess.run(cmd, cwd="/tmp")
+    return result.returncode
+
+
+def run_shell_session(project_path: Path) -> int:
+    """
+    Run an interactive shell as the claude user in the project directory.
+    Returns the exit code.
+    """
+    info(f"Starting shell session in {project_path}")
+    info("Running as user: claude")
+    info("Tip: You can run 'claude' from this shell if needed")
+    print()
+
+    preamble = prepare_sandbox_environment()
+
+    cmd = [
+        'sudo', '-H', '-u', 'claude',
+        'bash', '-c',
+        f'{preamble} && cd {shlex.quote(str(project_path))} && exec bash -l'
+    ]
+
     result = subprocess.run(cmd, cwd="/tmp")
     return result.returncode
 
@@ -1052,7 +1086,7 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
         capture=True
     )
     if result.stdout.strip():
-        warn("There are uncommitted changes in Claude's working directory:")
+        warn("There are uncommitted changes in the working directory:")
         run_as_claude(['git', '-C', str(claude_repo_path), 'status', '--short'])
         print()
 
@@ -1251,10 +1285,10 @@ def cmd_clear_worktrees(project_name: str) -> None:
     remove_all_worktrees(project_name)
 
 
-def cmd_resume(session_id: Optional[str], claude_args: list[str]) -> int:
+def cmd_resume(session_id: Optional[str], claude_args: list[str], shell_mode: bool = False) -> int:
     """
     Handle --resume command.
-    Returns exit code from Claude.
+    Returns exit code.
     """
     if session_id is None:
         # Show list and let user pick
@@ -1280,24 +1314,24 @@ def cmd_resume(session_id: Optional[str], claude_args: list[str]) -> int:
         if not session:
             error(f"Session not found: {session_id}")
 
-    return resume_session(session, claude_args)
+    return resume_session(session, claude_args, shell_mode)
 
 
-def cmd_worktree_resume(project_name: str, worktree_name: str, claude_args: list[str]) -> int:
+def cmd_worktree_resume(project_name: str, worktree_name: str, claude_args: list[str], shell_mode: bool = False) -> int:
     """
     Handle -w/--worktree command.
-    Returns exit code from Claude.
+    Returns exit code.
     """
     session = find_session_by_worktree(project_name, worktree_name)
     if not session:
         error(f"Worktree '{worktree_name}' not found for project '{project_name}'")
-    return resume_session(session, claude_args)
+    return resume_session(session, claude_args, shell_mode)
 
 
-def cmd_start_session(origin_path: Path, claude_args: list[str]) -> int:
+def cmd_start_session(origin_path: Path, claude_args: list[str], shell_mode: bool = False) -> int:
     """
     Start a new session or prompt to resume existing.
-    Returns exit code from Claude.
+    Returns exit code.
     """
     project_name = origin_path.name
 
@@ -1306,10 +1340,10 @@ def cmd_start_session(origin_path: Path, claude_args: list[str]) -> int:
     if existing_sessions:
         selected_session = prompt_worktree_choice(existing_sessions)
         if selected_session:
-            return resume_session(selected_session, claude_args)
+            return resume_session(selected_session, claude_args, shell_mode)
 
     # Start new session with worktree
-    _, exit_code = start_new_session(origin_path, claude_args)
+    _, exit_code = start_new_session(origin_path, claude_args, shell_mode)
     return exit_code
 
 
@@ -1447,6 +1481,8 @@ Examples:
   yoloclaude --import-claude                  # Import Claude session from current dir
   yoloclaude --import-claude /path/to/repo    # Import Claude session from specified path
   yoloclaude --import-claude . --session abc  # Import specific session by ID
+  yoloclaude myproject --shell                # Drop into shell in worktree
+  yoloclaude myproject -w name --shell        # Resume worktree in shell mode
         """
     )
     parser.add_argument(
@@ -1508,6 +1544,11 @@ Examples:
         metavar='SESSION_ID',
         help='Specific Claude session ID to import (used with --import-claude)'
     )
+    parser.add_argument(
+        '-s', '--shell',
+        action='store_true',
+        help='Drop into a shell instead of running Claude Code'
+    )
 
     args = parser.parse_args()
 
@@ -1554,11 +1595,13 @@ Examples:
     # Handle --resume
     if args.resume is not None:
         session_id = None if args.resume == '__list__' else args.resume
-        exit_code = cmd_resume(session_id, args.claude_args)
+        exit_code = cmd_resume(session_id, args.claude_args, args.shell)
         sys.exit(exit_code)
 
     # Handle --import-claude
     if args.import_claude is not None:
+        if args.shell:
+            error("--shell cannot be used with --import-claude (import is Claude-specific)")
         import_path = Path(args.import_claude).resolve()
         exit_code = cmd_import_claude(import_path, args.session, args.claude_args)
         sys.exit(exit_code)
@@ -1575,11 +1618,11 @@ Examples:
 
     # Handle --worktree: resume a specific worktree
     if args.worktree:
-        exit_code = cmd_worktree_resume(origin_path.name, args.worktree, args.claude_args)
+        exit_code = cmd_worktree_resume(origin_path.name, args.worktree, args.claude_args, args.shell)
         sys.exit(exit_code)
 
     # Start session (prompts if existing worktrees)
-    exit_code = cmd_start_session(origin_path, args.claude_args)
+    exit_code = cmd_start_session(origin_path, args.claude_args, args.shell)
     sys.exit(exit_code)
 
 

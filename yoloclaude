@@ -1102,9 +1102,11 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
             # ownership" check - the -c safe.directory option doesn't propagate
             # to the git-upload-pack subprocess that runs in the worktree
             #
-            # Create the bundle inside the worktree (which claude owns) so
-            # claude can write to it, then the invoking user reads from it
-            bundle_path = str(claude_repo_path / '.yoloclaude-sync.bundle')
+            # Create the bundle in /tmp (world-accessible) rather than inside
+            # the worktree, because the invoking user may not have traverse
+            # permission through /home/claude. We let claude create the file
+            # (claude can write to /tmp which has 1777 permissions).
+            bundle_path = f'/tmp/yoloclaude-sync-{os.getpid()}-{branch.replace("/", "-")}.bundle'
             try:
                 # Create bundle as claude (who owns the worktree)
                 info(f"Syncing changes to {origin_path}...")
@@ -1112,7 +1114,7 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
                     'git', '-C', str(claude_repo_path),
                     'bundle', 'create', bundle_path, branch
                 ])
-                # Make bundle readable by invoking user
+                # Make bundle readable by invoking user (in case umask restricted it)
                 run_as_claude(['chmod', '644', bundle_path])
                 # Fetch from bundle as invoking user (who owns origin)
                 run_cmd([
@@ -1120,7 +1122,7 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path) -> None:
                     'fetch', bundle_path, f'{branch}:{branch}'
                 ])
             finally:
-                # Clean up bundle (as claude, since claude owns it)
+                # Clean up bundle (as claude since claude owns it)
                 run_as_claude(['rm', '-f', bundle_path], check=False)
             info("Changes synced to your local repo.")
 

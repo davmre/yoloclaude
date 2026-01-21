@@ -129,6 +129,44 @@ create_test_repo() {
 }
 
 # ============================================================================
+# Test: Restricted permission files don't break rsync
+# ============================================================================
+test_restricted_permissions() {
+    log_test "Testing rsync with restricted permission directories..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+
+    # Create a .claude directory with restricted permissions (only owner can read)
+    # This simulates the real-world scenario where ~/.claude/settings.local.json
+    # has restricted permissions
+    mkdir -p "$USER_REPO/.claude"
+    echo '{"some": "settings"}' > "$USER_REPO/.claude/settings.local.json"
+    chmod 600 "$USER_REPO/.claude/settings.local.json"
+    chmod 700 "$USER_REPO/.claude"
+
+    # Create cache directories with restricted permissions
+    mkdir -p "$USER_REPO/.ruff_cache/0.14.11"
+    echo "cache data" > "$USER_REPO/.ruff_cache/0.14.11/somefile"
+    chmod 600 "$USER_REPO/.ruff_cache/0.14.11/somefile"
+    chmod 700 "$USER_REPO/.ruff_cache/0.14.11"
+    chmod 700 "$USER_REPO/.ruff_cache"
+
+    mkdir -p "$USER_REPO/__pycache__"
+    echo "bytecode" > "$USER_REPO/__pycache__/module.pyc"
+    chmod 600 "$USER_REPO/__pycache__/module.pyc"
+    chmod 700 "$USER_REPO/__pycache__"
+
+    # Verify the directories are NOT readable by claude user
+    if sudo -u claude test -r "$USER_REPO/.claude" 2>/dev/null; then
+        log_info ".claude directory is readable by claude (unexpected, but ok)"
+    else
+        log_info ".claude directory correctly unreadable by claude user"
+    fi
+
+    log_pass "Created restricted permission directories for testing"
+}
+
+# ============================================================================
 # Test: yoloclaude with local repo path (creates worktree)
 # ============================================================================
 test_local_repo() {
@@ -165,6 +203,29 @@ test_local_repo() {
         log_fail "No worktree found in $BASE_CLONE/worktrees"
         sudo -u claude ls -la "$BASE_CLONE/worktrees" 2>/dev/null || echo "Cannot list worktrees dir"
         return 1
+    fi
+
+    # Verify excluded directories were NOT synced to worktree
+    # These have restricted permissions in USER_REPO and should be excluded by rsync
+    if sudo -u claude test -d "$WORKTREE_PATH/.claude"; then
+        log_fail ".claude directory should be excluded from worktree sync"
+        return 1
+    else
+        log_pass ".claude directory correctly excluded from worktree"
+    fi
+
+    if sudo -u claude test -d "$WORKTREE_PATH/.ruff_cache"; then
+        log_fail ".ruff_cache directory should be excluded from worktree sync"
+        return 1
+    else
+        log_pass ".ruff_cache directory correctly excluded from worktree"
+    fi
+
+    if sudo -u claude test -d "$WORKTREE_PATH/__pycache__"; then
+        log_fail "__pycache__ directory should be excluded from worktree sync"
+        return 1
+    else
+        log_pass "__pycache__ directory correctly excluded from worktree"
     fi
 
     # Verify origin points to user's repo
@@ -576,6 +637,7 @@ main() {
     test_help
     test_setup
     create_test_repo
+    test_restricted_permissions
     test_local_repo
     test_git_push_flow
     test_second_worktree

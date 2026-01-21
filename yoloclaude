@@ -1404,9 +1404,21 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
     # Sync uncommitted changes from origin to worktree
     # This ensures the worktree has the same working state as the origin,
     # not just the same committed state
+    # Exclude: .git (managed separately), .claude (user-specific settings),
+    # and cache directories (regenerated automatically, may have restricted perms)
     info("Syncing uncommitted changes from origin...")
     run_as_claude([
-        'rsync', '-a', '--delete', '--exclude=.git',
+        'rsync', '-a', '--delete',
+        '--exclude=.git',
+        '--exclude=.claude',
+        '--exclude=__pycache__',
+        '--exclude=.pytest_cache',
+        '--exclude=.ruff_cache',
+        '--exclude=.mypy_cache',
+        '--exclude=node_modules/.cache',
+        '--exclude=.next',
+        '--exclude=.nuxt',
+        '--exclude=.turbo',
         str(origin_path) + '/',   # trailing slash = contents of directory
         str(worktree_path) + '/'
     ])

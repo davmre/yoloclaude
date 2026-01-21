@@ -267,6 +267,61 @@ install_claude_code() {
     fi
 }
 
+# Set up user-level CLAUDE.md with yoloclaude environment instructions
+setup_claude_md() {
+    info "Setting up user-level CLAUDE.md for claude user..."
+
+    local claude_home
+    if [[ "$PLATFORM" == "macos" ]]; then
+        claude_home="/Users/claude"
+    else
+        claude_home="/home/claude"
+    fi
+
+    local claude_md_dir="$claude_home/.claude"
+    local claude_md_path="$claude_md_dir/CLAUDE.md"
+
+    # Create .claude directory if needed
+    sudo -H -u claude mkdir -p "$claude_md_dir"
+
+    # Write the CLAUDE.md file
+    cat << 'CLAUDE_MD_EOF' | sudo -H -u claude tee "$claude_md_path" > /dev/null
+# yoloclaude Sandbox Environment
+
+You are running inside a **yoloclaude sandbox**. This provides isolation
+between you and the invoking user's environment.
+
+## Key Points
+
+**Git origin is local, not remote:**
+- Your git `origin` points to the invoking user's local repo, not GitHub/GitLab
+- This is intentional for sandbox isolation
+
+**Do NOT try to push:**
+- You cannot push directly (permission denied is expected)
+- **yoloclaude handles syncing** when the session ends
+- Just commit your changes normally - sync happens automatically
+
+**You are the `claude` user:**
+- Isolated Unix user with its own home directory
+- You're working in a git worktree under ~/projects/<project>/worktrees/
+- Each session gets its own worktree branch
+
+## Workflow
+
+1. Make changes and commit them normally
+2. When the session ends, yoloclaude will:
+   - Sync your commits to the invoking user's repo
+   - Offer to merge into their branch
+   - Offer to push to the remote
+
+If you see "permission denied" on push, this is expected - just let the
+session end and yoloclaude will handle it.
+CLAUDE_MD_EOF
+
+    info "Created $claude_md_path"
+}
+
 # Print final instructions
 print_instructions() {
     local claude_home
@@ -343,6 +398,7 @@ main() {
     setup_shared_temp
     configure_sudo
     setup_git_config
+    setup_claude_md
     install_claude_code || true  # Don't fail if install fails - user can install manually
     print_instructions
 }

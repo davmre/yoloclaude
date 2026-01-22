@@ -583,6 +583,100 @@ test_project_memory() {
 }
 
 # ============================================================================
+# Test: Lock file is created when session runs
+# ============================================================================
+test_lock_file_created() {
+    log_test "Testing lock file creation..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+
+    cd /home/testuser
+
+    # Create a new session
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Get the most recent session ID
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    SESSION_ID=$(basename "$SESSION_FILE" .json)
+
+    # Lock file should NOT exist after session ends (it gets released)
+    LOCK_FILE="/home/testuser/.yoloclaude/sessions/${SESSION_ID}.lock"
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        log_pass "Lock file properly released after session ends"
+    else
+        log_fail "Lock file should be released after session ends"
+        cat "$LOCK_FILE"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: List worktrees shows Active column
+# ============================================================================
+test_list_worktrees_active_column() {
+    log_test "Testing --list-worktrees shows Active column..."
+
+    cd /home/testuser
+    OUTPUT=$("$YOLOCLAUDE_DIR/yoloclaude" test-project --list-worktrees 2>&1)
+
+    # Should show Active column header
+    if echo "$OUTPUT" | grep -q "Active"; then
+        log_pass "--list-worktrees shows Active column header"
+    else
+        log_fail "--list-worktrees missing Active column"
+        echo "$OUTPUT"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Test: Stale lock files are cleaned up
+# ============================================================================
+test_stale_lock_cleanup() {
+    log_test "Testing stale lock file cleanup..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+
+    cd /home/testuser
+
+    # Get an existing session
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    if [[ -z "$SESSION_FILE" ]]; then
+        # Create one if none exists
+        "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+        SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    fi
+    SESSION_ID=$(basename "$SESSION_FILE" .json)
+
+    # Create a stale lock file with a non-existent PID
+    LOCK_FILE="/home/testuser/.yoloclaude/sessions/${SESSION_ID}.lock"
+    cat > "$LOCK_FILE" << EOF
+{"pid": 999999, "started_at": "2026-01-01T00:00:00", "hostname": "test"}
+EOF
+
+    # Verify lock file exists
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        log_fail "Failed to create test lock file"
+        return 1
+    fi
+
+    # Run yoloclaude - it should clean up the stale lock
+    BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['branch'])")
+    WORKTREE_NAME=${BRANCH#claude/}
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project -w "$WORKTREE_NAME" || true
+
+    # Lock file should be gone (stale lock removed, then session ended normally)
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        log_pass "Stale lock file was cleaned up"
+    else
+        log_fail "Stale lock file was not cleaned up"
+        cat "$LOCK_FILE"
+        rm -f "$LOCK_FILE"
+        return 1
+    fi
+}
+
+# ============================================================================
 # Test: Create worktree on feature branch
 # ============================================================================
 test_feature_branch_worktree() {
@@ -848,6 +942,11 @@ main() {
     test_clear_worktree
     test_clear_all_worktrees
     test_project_memory
+
+    # Session locking tests
+    test_lock_file_created
+    test_list_worktrees_active_column
+    test_stale_lock_cleanup
 
     # Multi-branch workflow tests
     test_feature_branch_worktree

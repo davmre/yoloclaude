@@ -271,6 +271,72 @@ def get_sessions_dir() -> Path:
     return Path.home() / ".yoloclaude" / "sessions"
 
 
+def get_lock_file_path(session_id: str) -> Path:
+    """Get the path to a session's lock file."""
+    return get_sessions_dir() / f"{session_id}.lock"
+
+
+def is_process_running(pid: int) -> bool:
+    """Check if a process with the given PID is running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def create_session_lock(session_id: str) -> bool:
+    """Create a lock file. Returns False if already locked by a running process."""
+    lock_path = get_lock_file_path(session_id)
+    if lock_path.exists():
+        try:
+            with open(lock_path) as f:
+                lock_data = json.load(f)
+            if lock_data.get("pid") and is_process_running(lock_data["pid"]):
+                return False  # Active lock exists
+            lock_path.unlink()  # Stale lock, remove it
+        except (json.JSONDecodeError, KeyError, OSError):
+            lock_path.unlink(missing_ok=True)
+
+    lock_data = {
+        "pid": os.getpid(),
+        "started_at": datetime.now().isoformat(),
+        "hostname": os.uname().nodename
+    }
+    with open(lock_path, 'w') as f:
+        json.dump(lock_data, f)
+    return True
+
+
+def release_session_lock(session_id: str) -> None:
+    """Release a session lock (only if owned by current process)."""
+    lock_path = get_lock_file_path(session_id)
+    if not lock_path.exists():
+        return
+    try:
+        with open(lock_path) as f:
+            lock_data = json.load(f)
+        if lock_data.get("pid") == os.getpid():
+            lock_path.unlink()
+    except (json.JSONDecodeError, FileNotFoundError, OSError):
+        pass
+
+
+def is_session_active(session: Session) -> Optional[dict]:
+    """Check if session has an active lock. Returns lock data if active, None otherwise."""
+    lock_path = get_lock_file_path(session.session_id)
+    if not lock_path.exists():
+        return None
+    try:
+        with open(lock_path) as f:
+            lock_data = json.load(f)
+        if lock_data.get("pid") and is_process_running(lock_data["pid"]):
+            return lock_data
+        return None
+    except (json.JSONDecodeError, KeyError, OSError):
+        return None
+
+
 def generate_session_id() -> str:
     """Generate a short unique session ID."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -530,8 +596,8 @@ def display_worktrees(sessions: list[Session]) -> None:
         return
 
     print()
-    print(f"{'#':<3} {'Worktree Name':<32} {'Base':<12} {'Status':<10} {'vs Origin':<18}")
-    print("-" * 78)
+    print(f"{'#':<3} {'Worktree Name':<32} {'Base':<12} {'Status':<10} {'Active':<8} {'vs Origin':<18}")
+    print("-" * 86)
 
     for i, session in enumerate(sessions, 1):
         worktree_name = get_worktree_name(session)
@@ -548,6 +614,10 @@ def display_worktrees(sessions: list[Session]) -> None:
             "modified": f"{Colors.YELLOW}modified{Colors.NC}",
             "missing": f"{Colors.RED}missing{Colors.NC}",
         }.get(status, status)
+
+        # Check if session is active
+        active_lock = is_session_active(session)
+        active_str = f"{Colors.CYAN}yes{Colors.NC}" if active_lock else ""
 
         # Get origin status
         if status != "missing":
@@ -566,7 +636,7 @@ def display_worktrees(sessions: list[Session]) -> None:
         else:
             origin_str = ""
 
-        print(f"{i:<3} {worktree_name:<32} {base_branch:<12} {status_str:<10} {origin_str}")
+        print(f"{i:<3} {worktree_name:<32} {base_branch:<12} {status_str:<10} {active_str:<8} {origin_str}")
 
     print()
 
@@ -954,7 +1024,7 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
 
     # Run Claude Code or shell
     if shell_mode:
-        exit_code = run_shell_session(worktree_path)
+        exit_code = run_shell_session(worktree_path, session)
     else:
         exit_code = run_claude_session(worktree_path, claude_args, session)
 
@@ -971,6 +1041,13 @@ def resume_session(session: Session, claude_args: list[str], shell_mode: bool = 
     """
     worktree_path = Path(session.worktree_path)
     origin_path = Path(session.origin_path)
+
+    # Check if session is already active
+    active_lock = is_session_active(session)
+    if active_lock:
+        warn(f"This session appears to be active (PID {active_lock['pid']})")
+        if not prompt_yes_no("Continue anyway? This may cause conflicts", default=False):
+            return 1
 
     # Verify worktree still exists
     if not path_exists_as_claude(worktree_path):
@@ -1012,7 +1089,7 @@ def resume_session(session: Session, claude_args: list[str], shell_mode: bool = 
 
     # Run Claude Code or shell
     if shell_mode:
-        exit_code = run_shell_session(worktree_path)
+        exit_code = run_shell_session(worktree_path, session)
     else:
         # Run Claude Code with --resume if we have a claude session ID
         if session.claude_session_id:
@@ -1150,46 +1227,66 @@ def run_claude_session(project_path: Path, claude_args: list[str], session: Opti
     Run Claude Code as the claude user in the project directory.
     Returns the exit code.
     """
-    info(f"Starting Claude Code session in {project_path}")
-    info("Running as user: claude")
-    print()
+    # Acquire lock
+    if session and not create_session_lock(session.session_id):
+        warn("Session appears to be locked by another process")
+        if not prompt_yes_no("Continue anyway?", default=False):
+            return 1
 
-    preamble = prepare_sandbox_environment()
-    claude_bin = get_claude_binary_path()
+    try:
+        info(f"Starting Claude Code session in {project_path}")
+        info("Running as user: claude")
+        print()
 
-    args_str = " ".join(shlex.quote(arg) for arg in claude_args)
-    cmd = [
-        'sudo', '-H', '-u', 'claude',
-        'bash', '-c',
-        f'{preamble} && cd {shlex.quote(str(project_path))} && {shlex.quote(claude_bin)} --dangerously-skip-permissions {args_str}'
-    ]
+        preamble = prepare_sandbox_environment()
+        claude_bin = get_claude_binary_path()
 
-    # Run from /tmp to avoid Claude Code picking up .claude settings from the
-    # invoking directory (which claude user may not have access to)
-    result = subprocess.run(cmd, cwd="/tmp")
-    return result.returncode
+        args_str = " ".join(shlex.quote(arg) for arg in claude_args)
+        cmd = [
+            'sudo', '-H', '-u', 'claude',
+            'bash', '-c',
+            f'{preamble} && cd {shlex.quote(str(project_path))} && {shlex.quote(claude_bin)} --dangerously-skip-permissions {args_str}'
+        ]
+
+        # Run from /tmp to avoid Claude Code picking up .claude settings from the
+        # invoking directory (which claude user may not have access to)
+        result = subprocess.run(cmd, cwd="/tmp")
+        return result.returncode
+    finally:
+        if session:
+            release_session_lock(session.session_id)
 
 
-def run_shell_session(project_path: Path) -> int:
+def run_shell_session(project_path: Path, session: Optional[Session] = None) -> int:
     """
     Run an interactive shell as the claude user in the project directory.
     Returns the exit code.
     """
-    info(f"Starting shell session in {project_path}")
-    info("Running as user: claude")
-    info("Tip: You can run 'claude' from this shell if needed")
-    print()
+    # Acquire lock
+    if session and not create_session_lock(session.session_id):
+        warn("Session appears to be locked by another process")
+        if not prompt_yes_no("Continue anyway?", default=False):
+            return 1
 
-    preamble = prepare_sandbox_environment()
+    try:
+        info(f"Starting shell session in {project_path}")
+        info("Running as user: claude")
+        info("Tip: You can run 'claude' from this shell if needed")
+        print()
 
-    cmd = [
-        'sudo', '-H', '-u', 'claude',
-        'bash', '-c',
-        f'{preamble} && cd {shlex.quote(str(project_path))} && exec bash -l'
-    ]
+        preamble = prepare_sandbox_environment()
 
-    result = subprocess.run(cmd, cwd="/tmp")
-    return result.returncode
+        cmd = [
+            'sudo', '-H', '-u', 'claude',
+            'bash', '-c',
+            f'{preamble} && cd {shlex.quote(str(project_path))} && exec bash -l'
+        ]
+
+        result = subprocess.run(cmd, cwd="/tmp")
+        return result.returncode
+    finally:
+        if session:
+            release_session_lock(session.session_id)
 
 
 def _sync_commits_via_bundle(claude_repo_path: Path, origin_path: Path, branch: str) -> None:

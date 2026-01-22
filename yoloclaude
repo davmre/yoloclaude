@@ -1332,8 +1332,11 @@ def _sync_commits_via_bundle(claude_repo_path: Path, origin_path: Path, branch: 
     info("Changes synced to your local repo.")
 
 
-def _offer_merge_to_source(origin_path: Path, branch: str, source_branch: str) -> None:
-    """Offer to merge the worktree branch into the source branch if possible."""
+def _offer_merge_to_source(origin_path: Path, branch: str, source_branch: str) -> bool:
+    """Offer to merge the worktree branch into the source branch if possible.
+
+    Returns True if a merge was actually performed, False otherwise.
+    """
     current_in_origin = get_origin_current_branch(origin_path)
 
     if current_in_origin == source_branch:
@@ -1347,12 +1350,15 @@ def _offer_merge_to_source(origin_path: Path, branch: str, source_branch: str) -
             if prompt_yes_no(f"Merge '{branch}' into '{source_branch}'? (fast-forward)"):
                 run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', branch])
                 info(f"Merged into {source_branch}.")
+                return True
         else:
             info(f"Branch '{branch}' can't be fast-forwarded into '{source_branch}'.")
             info(f"To merge manually: git checkout {source_branch} && git merge {branch}")
     else:
         info(f"Source branch '{source_branch}' is not checked out in origin.")
         info(f"To merge: git checkout {source_branch} && git merge {branch}")
+
+    return False
 
 
 def _offer_push_to_remote(origin_path: Path) -> None:
@@ -1424,8 +1430,9 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Se
     branch = branch_result.stdout.strip()
 
     _sync_commits_via_bundle(claude_repo_path, origin_path, branch)
-    _offer_merge_to_source(origin_path, branch, source_branch)
-    _offer_push_to_remote(origin_path)
+    merged = _offer_merge_to_source(origin_path, branch, source_branch)
+    if merged:
+        _offer_push_to_remote(origin_path)
 
 
 # =============================================================================

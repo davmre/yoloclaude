@@ -31,18 +31,24 @@ Claude's git "origin" points to your local repository, not the remote. This mean
 
 ### Setup
 
-1. Clone this repository:
+1. Clone and install:
    ```bash
-   git clone https://github.com/yourusername/yoloclaude.git
+   git clone https://github.com/dmarx/yoloclaude.git
    cd yoloclaude
+   ./install.sh
    ```
 
-2. Run the setup script to create the `claude` user:
+2. Ensure `~/.local/bin` is in your PATH (add to `~/.bashrc` or `~/.zshrc`):
    ```bash
-   sudo ./yoloclaude-setup
+   export PATH="$HOME/.local/bin:$PATH"
    ```
 
-3. Install Claude Code for the `claude` user:
+3. Run the setup script to create the `claude` user:
+   ```bash
+   sudo ~/.local/share/yoloclaude/yoloclaude-setup
+   ```
+
+4. Install Claude Code for the `claude` user:
    ```bash
    sudo -H -u claude -i
    curl -fsSL https://claude.ai/install.sh | sh
@@ -50,17 +56,20 @@ Claude's git "origin" points to your local repository, not the remote. This mean
    ```
    This gives the claude user its own installation that can auto-update.
 
-4. Authenticate Claude Code for the `claude` user:
+5. Authenticate Claude Code for the `claude` user:
    ```bash
    sudo -H -u claude -i claude
    ```
    Complete the authentication flow, then exit with `/exit`.
 
-5. Add `yoloclaude` to your PATH (optional):
-   ```bash
-   # Add to ~/.bashrc or ~/.zshrc:
-   export PATH="/path/to/yoloclaude:$PATH"
-   ```
+### Uninstall
+
+To remove yoloclaude:
+```bash
+./install.sh --uninstall
+```
+
+Note: This does not remove the `claude` user or system configuration.
 
 ## Usage
 

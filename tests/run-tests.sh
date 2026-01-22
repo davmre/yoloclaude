@@ -801,6 +801,103 @@ test_help() {
 }
 
 # ============================================================================
+# Test: install.sh script
+# ============================================================================
+test_install_script() {
+    log_test "Testing install.sh script..."
+
+    cd /opt/yoloclaude
+
+    # Test help
+    if ./install.sh --help | grep -q "Install yoloclaude"; then
+        log_pass "install.sh --help works"
+    else
+        log_fail "install.sh --help failed"
+        return 1
+    fi
+
+    # Run install
+    ./install.sh
+
+    # Verify install directory exists
+    if [[ -d "$HOME/.local/share/yoloclaude" ]]; then
+        log_pass "Install directory created"
+    else
+        log_fail "Install directory not created"
+        return 1
+    fi
+
+    # Verify files were copied
+    if [[ -f "$HOME/.local/share/yoloclaude/yoloclaude" ]] && \
+       [[ -f "$HOME/.local/share/yoloclaude/yoloclaude-setup" ]]; then
+        log_pass "Files copied to install directory"
+    else
+        log_fail "Files not copied to install directory"
+        return 1
+    fi
+
+    # Verify files are executable
+    if [[ -x "$HOME/.local/share/yoloclaude/yoloclaude" ]]; then
+        log_pass "Installed files are executable"
+    else
+        log_fail "Installed files not executable"
+        return 1
+    fi
+
+    # Verify symlink exists
+    if [[ -L "$HOME/.local/bin/yoloclaude" ]]; then
+        log_pass "Symlink created in ~/.local/bin"
+    else
+        log_fail "Symlink not created"
+        return 1
+    fi
+
+    # Verify symlink points to correct location
+    SYMLINK_TARGET=$(readlink "$HOME/.local/bin/yoloclaude")
+    if [[ "$SYMLINK_TARGET" == "$HOME/.local/share/yoloclaude/yoloclaude" ]]; then
+        log_pass "Symlink points to correct location"
+    else
+        log_fail "Symlink points to wrong location: $SYMLINK_TARGET"
+        return 1
+    fi
+
+    # Verify the symlinked command works
+    if "$HOME/.local/bin/yoloclaude" --help | grep -q "sandboxed user environment"; then
+        log_pass "Symlinked yoloclaude --help works"
+    else
+        log_fail "Symlinked yoloclaude --help failed"
+        return 1
+    fi
+
+    # Test uninstall
+    ./install.sh --uninstall
+
+    # Verify install directory removed
+    if [[ ! -d "$HOME/.local/share/yoloclaude" ]]; then
+        log_pass "Uninstall removed install directory"
+    else
+        log_fail "Uninstall did not remove install directory"
+        return 1
+    fi
+
+    # Verify symlink removed
+    if [[ ! -L "$HOME/.local/bin/yoloclaude" ]]; then
+        log_pass "Uninstall removed symlink"
+    else
+        log_fail "Uninstall did not remove symlink"
+        return 1
+    fi
+
+    # Test invalid option
+    if ./install.sh --invalid 2>&1 | grep -q "Unknown option"; then
+        log_pass "Invalid option shows error"
+    else
+        log_fail "Invalid option should show error"
+        return 1
+    fi
+}
+
+# ============================================================================
 # Test: Error handling for missing repo
 # ============================================================================
 test_missing_repo() {
@@ -831,6 +928,7 @@ main() {
 
     # Run tests
     test_help
+    test_install_script
     test_setup
     create_test_repo
     test_restricted_permissions

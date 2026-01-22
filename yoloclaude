@@ -278,11 +278,20 @@ def generate_session_id() -> str:
     return f"{timestamp}-{hash_suffix}"
 
 
-def generate_branch_name(project_name: str) -> str:
-    """Generate a default branch name for a new session."""
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+def generate_branch_name(source_branch: str) -> str:
+    """Generate a default worktree branch name based on the source branch."""
+    # Strip 'claude/' prefix to avoid 'claude/claude/...'
+    base_name = source_branch
+    if base_name.startswith('claude/'):
+        base_name = base_name[len('claude/'):]
+
+    # Truncate very long branch names
+    MAX_BASE_LENGTH = 50
+    if len(base_name) > MAX_BASE_LENGTH:
+        base_name = base_name[:MAX_BASE_LENGTH]
+
     hash_suffix = hashlib.sha256(str(datetime.now().timestamp()).encode()).hexdigest()[:4]
-    return f"claude/{project_name}-{timestamp}-{hash_suffix}"
+    return f"claude/{base_name}-worktree-{hash_suffix}"
 
 
 def create_session(
@@ -476,13 +485,14 @@ def prompt_source_branch(origin_path: Path) -> str:
     branches = list_origin_branches(origin_path)
 
     if AUTO_YES:
-        info(f"Using branch: {current} [auto]")
+        info(f"Source branch: {current} [auto]")
         return current
 
     print()
+    info(f"Source branch: {current}")
     info(f"Available branches: {', '.join(branches[:5])}" +
          (f" (+{len(branches)-5} more)" if len(branches) > 5 else ""))
-    branch = prompt(f"Base worktree on which branch? [{current}]")
+    branch = prompt(f"Source branch (Enter for {current})")
     return branch.strip() if branch.strip() else current
 
 
@@ -902,17 +912,17 @@ def create_worktree(base_repo: Path, origin_path: Path, branch_name: str, source
     return worktree_path
 
 
-def prompt_branch_name(project_name: str) -> str:
-    """Prompt for a branch name with an auto-generated default."""
-    default_name = generate_branch_name(project_name)
+def prompt_branch_name(source_branch: str) -> str:
+    """Prompt for a worktree branch name with an auto-generated default."""
+    default_name = generate_branch_name(source_branch)
 
     if AUTO_YES:
-        info(f"Using branch: {default_name} [auto]")
+        info(f"Worktree branch: {default_name} [auto]")
         return default_name
 
     print()
-    info(f"Default branch name: {default_name}")
-    custom_name = prompt("Branch name (press Enter for default)")
+    info(f"Worktree branch: {default_name}")
+    custom_name = prompt("Worktree branch name (Enter for default)")
 
     if custom_name.strip():
         # Ensure branch name has claude/ prefix for clarity
@@ -935,8 +945,8 @@ def start_new_session(origin_path: Path, claude_args: list[str], shell_mode: boo
     # Prompt for source branch
     source_branch = prompt_source_branch(origin_path)
 
-    # Get branch name from user
-    branch_name = prompt_branch_name(project_name)
+    # Get worktree branch name from user
+    branch_name = prompt_branch_name(source_branch)
 
     # Create worktree based on source branch
     worktree_path = create_worktree(base_repo, origin_path, branch_name, source_branch)
@@ -1512,10 +1522,10 @@ def cmd_import_claude(import_path: Path, session_uuid: Optional[str], claude_arg
 
     # Auto-detect source branch (don't prompt since we're rsyncing current state)
     source_branch = get_origin_current_branch(origin_path)
-    info(f"Using current branch: {source_branch}")
+    info(f"Source branch: {source_branch}")
 
-    # Get branch name
-    branch_name = prompt_branch_name(project_name)
+    # Get worktree branch name
+    branch_name = prompt_branch_name(source_branch)
 
     # Create worktree based on source branch
     worktree_path = create_worktree(base_repo, origin_path, branch_name, source_branch)

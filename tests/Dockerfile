@@ -27,7 +27,7 @@ RUN useradd -m -s /bin/bash testuser \
 WORKDIR /opt/yoloclaude
 
 # Copy yoloclaude source files
-COPY yoloclaude yoloclaude-setup README.md LICENSE ./
+COPY yoloclaude yoloclaude-setup install.sh README.md LICENSE ./
 COPY tests/ ./tests/
 
 # Make scripts executable

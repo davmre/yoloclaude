@@ -385,8 +385,8 @@ test_list_worktrees() {
     fi
 
     # Should show at least 2 worktrees from previous tests
-    # Worktree names are like "test-project-20260121-123456-abcd"
-    WORKTREE_COUNT=$(echo "$OUTPUT" | grep -c "test-project-" || true)
+    # Worktree names are like "main-worktree-abcd" (based on source branch)
+    WORKTREE_COUNT=$(echo "$OUTPUT" | grep -c "main-worktree-" || true)
     if [[ "$WORKTREE_COUNT" -ge 2 ]]; then
         log_pass "--list-worktrees shows $WORKTREE_COUNT worktrees"
     else

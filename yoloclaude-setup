@@ -256,7 +256,8 @@ install_claude_code() {
 
     # Use the official installer, which installs to ~/.local/bin/claude
     # The -H flag ensures HOME is set correctly
-    if sudo -H -u claude bash -c 'curl -fsSL https://claude.ai/install.sh | sh'; then
+    # Use bash (not sh) because the installer uses bash-specific syntax
+    if sudo -H -u claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
         info "Claude Code installed successfully"
         return 0
     else

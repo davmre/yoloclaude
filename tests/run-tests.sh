@@ -99,6 +99,17 @@ test_setup() {
         log_fail "git not configured for claude user"
         return 1
     fi
+
+    # Replace real Claude with mock for testing (yoloclaude prefers ~/.local/bin/claude)
+    # Check as claude user since testuser may not have access to claude's home
+    if sudo -u claude test -f /home/claude/.local/bin/claude; then
+        log_info "Replacing real Claude with mock at /home/claude/.local/bin/claude"
+        sudo cp /usr/local/bin/claude /home/claude/.local/bin/claude
+        sudo chown claude:claude /home/claude/.local/bin/claude
+        sudo chmod +x /home/claude/.local/bin/claude
+    else
+        log_info "Claude not installed to ~/.local/bin, mock at /usr/local/bin will be used via PATH"
+    fi
 }
 
 # ============================================================================
@@ -709,7 +720,8 @@ test_feature_branch_worktree() {
     fi
 
     # Verify worktree is based on feature-test (has feature.txt)
-    WORKTREE_PATH=$(sudo -u claude find "$BASE_CLONE/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | tail -1)
+    # Get the worktree path from the session file (find order is filesystem-dependent)
+    WORKTREE_PATH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['worktree_path'])")
     if sudo -u claude test -f "$WORKTREE_PATH/feature.txt"; then
         log_pass "Worktree contains feature branch content"
     else

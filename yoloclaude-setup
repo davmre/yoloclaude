@@ -311,6 +311,12 @@ This session is managed by `yoloclaude`, a tool to create sandboxed environents 
 - You cannot push directly (permission denied is expected)
 - **yoloclaude handles syncing** when the session ends. No need to push.
 - Just commit changes normally - sync happens automatically.
+
+**macOS: Accessing screenshots and other protected files:**
+- macOS TCC (Transparency, Consent, and Control) blocks access to Desktop, Documents, and Downloads folders even with correct Unix permissions
+- If you need to read files from these locations (e.g., screenshots), ask the user to create a symlink that bypasses TCC:
+  \`ln -s ~/Desktop ~/.desktop-share\`
+- You can then access files via \`/Users/<username>/.desktop-share/\` instead
 CLAUDE_MD_EOF
 
     info "Created $claude_md_path"

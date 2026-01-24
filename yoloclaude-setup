@@ -108,20 +108,24 @@ setup_macos_keychain() {
     local keychain_path="$keychain_dir/login.keychain-db"
 
     # Create Keychains directory if it doesn't exist
-    sudo -H -u claude mkdir -p "$keychain_dir"
+    # Run from /tmp to avoid "permission denied" if cwd is in user's home directory
+    (
+        cd /tmp
+        sudo -H -u claude mkdir -p "$keychain_dir"
 
-    # Create the keychain with a simple password (security is via Unix permissions, not keychain password)
-    # The keychain password is 'claude' - this is fine since the user account itself is the security boundary
-    sudo -H -u claude security create-keychain -p "claude" "$keychain_path" 2>/dev/null || true
+        # Create the keychain with a simple password (security is via Unix permissions, not keychain password)
+        # The keychain password is 'claude' - this is fine since the user account itself is the security boundary
+        sudo -H -u claude security create-keychain -p "claude" "$keychain_path" 2>/dev/null || true
 
-    # Set it as the default keychain
-    sudo -H -u claude security default-keychain -s "$keychain_path" 2>/dev/null || true
+        # Set it as the default keychain
+        sudo -H -u claude security default-keychain -s "$keychain_path" 2>/dev/null || true
 
-    # Unlock the keychain (it will stay unlocked for this session)
-    sudo -H -u claude security unlock-keychain -p "claude" "$keychain_path" 2>/dev/null || true
+        # Unlock the keychain (it will stay unlocked for this session)
+        sudo -H -u claude security unlock-keychain -p "claude" "$keychain_path" 2>/dev/null || true
 
-    # Set keychain settings to not auto-lock (since this is a service account)
-    sudo -H -u claude security set-keychain-settings "$keychain_path" 2>/dev/null || true
+        # Set keychain settings to not auto-lock (since this is a service account)
+        sudo -H -u claude security set-keychain-settings "$keychain_path" 2>/dev/null || true
+    )
 
     info "Keychain created at $keychain_path"
 }
@@ -213,13 +217,17 @@ setup_git_config() {
 
     # Create .gitconfig
     # Note: -H flag ensures HOME is set to claude's home directory (critical on macOS)
-    sudo -H -u claude git config --global user.name "Claude Code"
-    sudo -H -u claude git config --global user.email "claude@localhost"
-    sudo -H -u claude git config --global init.defaultBranch main
+    # Run from /tmp to avoid "permission denied" if cwd is in user's home directory
+    (
+        cd /tmp
+        sudo -H -u claude git config --global user.name "Claude Code"
+        sudo -H -u claude git config --global user.email "claude@localhost"
+        sudo -H -u claude git config --global init.defaultBranch main
 
-    # Allow claude to access repos owned by other users
-    # This is needed because claude clones from the invoking user's local repos
-    sudo -H -u claude git config --global safe.directory '*'
+        # Allow claude to access repos owned by other users
+        # This is needed because claude clones from the invoking user's local repos
+        sudo -H -u claude git config --global safe.directory '*'
+    )
 
     info "Configured git for claude user"
 }
@@ -257,7 +265,8 @@ install_claude_code() {
     # Use the official installer, which installs to ~/.local/bin/claude
     # The -H flag ensures HOME is set correctly
     # Use bash (not sh) because the installer uses bash-specific syntax
-    if sudo -H -u claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
+    # Run from /tmp to avoid "permission denied" if cwd is in user's home directory
+    if (cd /tmp && sudo -H -u claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash'); then
         info "Claude Code installed successfully"
         return 0
     else
@@ -325,16 +334,10 @@ CLAUDE_MD_EOF
 # Print final instructions
 print_instructions() {
     local claude_home
-    local claude_installed=false
     if [[ "$PLATFORM" == "macos" ]]; then
         claude_home="/Users/claude"
     else
         claude_home="/home/claude"
-    fi
-
-    # Check if claude is available to the claude user
-    if sudo -H -u claude bash -c 'command -v claude' &>/dev/null; then
-        claude_installed=true
     fi
 
     echo ""
@@ -344,29 +347,13 @@ print_instructions() {
     echo ""
     echo "Next steps:"
     echo ""
-
-    if [[ "$claude_installed" == "true" ]]; then
-        echo "1. Authenticate Claude Code for the claude user:"
-        echo "   sudo -H -u claude -i claude"
-        echo ""
-        echo "   This will open Claude Code and prompt you to log in."
-        echo "   Complete the authentication, then exit with /exit or Ctrl+C."
-        echo ""
-        echo "2. Start using yoloclaude:"
-    else
-        echo "1. Install Claude Code for the claude user:"
-        echo "   sudo -H -u claude -i"
-        echo "   curl -fsSL https://claude.ai/install.sh | sh"
-        echo "   exit"
-        echo ""
-        echo "2. Authenticate Claude Code for the claude user:"
-        echo "   sudo -H -u claude -i claude"
-        echo ""
-        echo "   This will open Claude Code and prompt you to log in."
-        echo "   Complete the authentication, then exit with /exit or Ctrl+C."
-        echo ""
-        echo "3. Start using yoloclaude:"
-    fi
+    echo "1. Authenticate Claude Code for the claude user:"
+    echo "   sudo -H -u claude -i claude"
+    echo ""
+    echo "   This will open Claude Code and prompt you to log in."
+    echo "   Complete the authentication, then exit with /exit or Ctrl+C."
+    echo ""
+    echo "2. Start using yoloclaude:"
     echo "   yoloclaude https://github.com/user/repo"
     echo "   yoloclaude /path/to/local/repo"
     echo ""

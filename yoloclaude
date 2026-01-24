@@ -599,6 +599,60 @@ def get_worktree_origin_status(session: Session) -> dict:
     return {'behind': behind, 'ahead': ahead, 'can_ff': can_ff, 'error': None}
 
 
+def get_worktree_branch_status(session: Session) -> dict:
+    """
+    Check if the worktree's own branch has been updated in the origin repo.
+
+    This detects when a user syncs commits back to their local repo, makes
+    additional changes on the worktree branch there, and then tries to resume
+    the session. Without this check, the worktree would be out of sync with
+    the "canonical" version of its branch in the user's repo.
+
+    Returns a dict with:
+      - exists: bool - whether the branch exists in origin
+      - behind: int - commits worktree is behind origin's branch
+      - ahead: int - commits worktree is ahead of origin's branch
+      - can_ff: bool - whether worktree can fast-forward to origin's branch
+      - diverged: bool - whether branches have diverged
+      - error: str or None - error message if check failed
+    """
+    worktree_path = Path(session.worktree_path)
+    branch = session.branch
+
+    if not path_exists_as_claude(worktree_path):
+        return {'exists': False, 'behind': 0, 'ahead': 0, 'can_ff': False, 'diverged': False, 'error': 'missing'}
+
+    # Note: We assume origin has already been fetched by get_worktree_origin_status
+
+    upstream = f'origin/{branch}'
+
+    # Check if the branch exists in origin (it may not if never synced)
+    check = run_as_claude(
+        ['git', '-C', str(worktree_path), 'rev-parse', '--verify', upstream],
+        capture=True, check=False
+    )
+    if check.returncode != 0:
+        # Branch doesn't exist in origin - this is fine, just means never synced
+        return {'exists': False, 'behind': 0, 'ahead': 0, 'can_ff': False, 'diverged': False, 'error': None}
+
+    # Get ahead/behind counts
+    result = run_as_claude(
+        ['git', '-C', str(worktree_path), 'rev-list', '--left-right', '--count', f'{upstream}...HEAD'],
+        capture=True, check=False
+    )
+    if result.returncode != 0:
+        return {'exists': True, 'behind': 0, 'ahead': 0, 'can_ff': False, 'diverged': False, 'error': 'comparison failed'}
+
+    parts = result.stdout.strip().split()
+    behind = int(parts[0]) if parts else 0
+    ahead = int(parts[1]) if len(parts) >= 2 else 0
+
+    can_ff = behind > 0 and ahead == 0
+    diverged = behind > 0 and ahead > 0
+
+    return {'exists': True, 'behind': behind, 'ahead': ahead, 'can_ff': can_ff, 'diverged': diverged, 'error': None}
+
+
 def display_worktrees(sessions: list[Session]) -> None:
     """Display worktrees in a table format with status."""
     if not sessions:
@@ -1088,6 +1142,82 @@ def resume_session(session: Session, claude_args: list[str], shell_mode: bool = 
                     info("Fast-forwarded to latest.")
                 else:
                     warn(f"Fast-forward failed: {result.stderr.strip()}")
+
+    # Check if the worktree's own branch has been updated in origin
+    # This happens when a user syncs back, makes changes on the worktree branch,
+    # and then tries to resume the session
+    branch_status = get_worktree_branch_status(session)
+
+    if branch_status.get('error'):
+        warn(f"Could not check worktree branch status: {branch_status['error']}")
+    elif branch_status['exists']:
+        if branch_status['diverged']:
+            # Branches have diverged - this is the case the user hit
+            print()
+            warn(f"Worktree branch '{session.branch}' has diverged from your local repo!")
+            print()
+            info("Your local repo has commits on this branch that aren't in the worktree.")
+            info("This can happen if you synced changes back, then made edits locally.")
+            print()
+
+            # Show the divergence details
+            result = run_as_claude(
+                ['git', '-C', str(worktree_path), 'log', '-1', '--format=%h %s', 'HEAD'],
+                capture=True
+            )
+            worktree_head = result.stdout.strip()
+            result = run_as_claude(
+                ['git', '-C', str(worktree_path), 'log', '-1', '--format=%h %s', f'origin/{session.branch}'],
+                capture=True
+            )
+            origin_head = result.stdout.strip()
+
+            print(f"  Worktree: {worktree_head}")
+            print(f"  Local:    {origin_head}")
+            print()
+
+            print("Options:")
+            print(f"  [1] Reset worktree to match local (LOSES worktree commits)")
+            print(f"  [2] Continue anyway (may cause sync issues later)")
+            print(f"  [3] Abort")
+            print()
+
+            if AUTO_YES:
+                choice = '2'
+                info("Auto-selecting option 2 (continue anyway)")
+            else:
+                choice = prompt("Your choice [1/2/3]").strip()
+
+            if choice == '1':
+                warn(f"Resetting worktree to match local branch...")
+                result = run_as_claude(
+                    ['git', '-C', str(worktree_path), 'reset', '--hard', f'origin/{session.branch}'],
+                    capture=True, check=False
+                )
+                if result.returncode == 0:
+                    info("Worktree reset to match local branch.")
+                else:
+                    warn(f"Reset failed: {result.stderr.strip()}")
+            elif choice == '3':
+                info("Aborting. Resolve the divergence manually before resuming.")
+                return 1
+            # choice == '2' or anything else: continue anyway
+
+        elif branch_status['can_ff']:
+            # Worktree is behind origin's copy of the branch - can fast-forward
+            if check_worktree_status(session) == "modified":
+                warn(f"Worktree has uncommitted changes. Cannot sync from local '{session.branch}'.")
+            else:
+                info(f"Your local '{session.branch}' has {branch_status['behind']} new commit(s).")
+                if prompt_yes_no("Sync these changes into the worktree?"):
+                    result = run_as_claude(
+                        ['git', '-C', str(worktree_path), 'merge', '--ff-only', f'origin/{session.branch}'],
+                        capture=True, check=False
+                    )
+                    if result.returncode == 0:
+                        info("Worktree updated with your local changes.")
+                    else:
+                        warn(f"Sync failed: {result.stderr.strip()}")
 
     # Update last accessed
     session.last_accessed = datetime.now().isoformat()

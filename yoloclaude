@@ -1499,6 +1499,124 @@ def _sync_commits_via_bundle(claude_repo_path: Path, origin_path: Path, branch: 
     )
     claude_head = head_result.stdout.strip()
 
+    # Check if the target branch is currently checked out in the origin repo
+    # Git refuses to fetch into a checked-out branch
+    current_branch_result = run_cmd(
+        ['git', '-C', str(origin_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+        capture=True, check=False
+    )
+    origin_current_branch = current_branch_result.stdout.strip() if current_branch_result.returncode == 0 else ""
+
+    if origin_current_branch == branch:
+        # The target branch is checked out - check if already in sync
+        origin_head_result = run_cmd(
+            ['git', '-C', str(origin_path), 'rev-parse', 'HEAD'],
+            capture=True, check=False
+        )
+        origin_head = origin_head_result.stdout.strip() if origin_head_result.returncode == 0 else ""
+
+        if origin_head == claude_head:
+            info(f"Branch '{branch}' is already in sync (both at {claude_head[:7]}).")
+            return branch
+
+        # Branch is checked out but commits differ - need special handling
+        print()
+        warn(f"Branch '{branch}' is currently checked out in your local repo.")
+        info("Git cannot update a branch that's checked out.")
+        print()
+
+        if origin_head:
+            # Check relationship between the two
+            is_ff = run_cmd(
+                ['git', '-C', str(origin_path), 'merge-base', '--is-ancestor', origin_head, claude_head],
+                capture=True, check=False
+            ).returncode == 0
+
+            if is_ff:
+                info(f"Your local branch can be fast-forwarded to Claude's commits.")
+                print()
+                print("Options:")
+                print(f"  [1] Update working directory (git pull in your repo)")
+                print(f"  [2] Create new branch '{branch}-2' with Claude's commits")
+                print("  [3] Skip sync")
+                print()
+
+                if AUTO_YES:
+                    choice = '1'
+                    info("Auto-selecting option 1 (update working directory)")
+                else:
+                    choice = prompt("Your choice [1/2/3]").strip()
+
+                if choice == '1':
+                    # Pull in the user's repo (they have it checked out)
+                    bundle_path = f'/tmp/yoloclaude-sync-{os.getpid()}-{branch.replace("/", "-")}.bundle'
+                    try:
+                        run_as_claude([
+                            'git', '-C', str(claude_repo_path),
+                            'bundle', 'create', bundle_path, branch
+                        ])
+                        run_as_claude(['chmod', '644', bundle_path])
+                        # Fetch to FETCH_HEAD, then merge
+                        run_cmd(['git', '-C', str(origin_path), 'fetch', bundle_path, branch])
+                        run_cmd(['git', '-C', str(origin_path), 'merge', '--ff-only', 'FETCH_HEAD'])
+                    finally:
+                        run_as_claude(['rm', '-f', bundle_path], check=False)
+                    info("Working directory updated with Claude's commits.")
+                    return branch
+                elif choice == '2':
+                    # Create new branch - handled below in normal flow
+                    pass
+                else:
+                    info("Skipping sync.")
+                    return None
+            else:
+                info(f"Branches have diverged and cannot be fast-forwarded.")
+                print()
+                print("Options:")
+                print(f"  [1] Create new branch '{branch}-2' with Claude's commits")
+                print("  [2] Skip sync (merge manually later)")
+                print()
+
+                if AUTO_YES:
+                    choice = '1'
+                    info("Auto-selecting option 1 (create new branch)")
+                else:
+                    choice = prompt("Your choice [1/2]").strip()
+
+                if choice != '1':
+                    info("Skipping sync.")
+                    return None
+
+        # Fall through to create new branch
+        suffix = 2
+        new_branch = f"{branch}-{suffix}"
+        while True:
+            check = run_cmd(
+                ['git', '-C', str(origin_path), 'rev-parse', '--verify', new_branch],
+                capture=True, check=False
+            )
+            if check.returncode != 0:
+                break
+            suffix += 1
+            new_branch = f"{branch}-{suffix}"
+
+        bundle_path = f'/tmp/yoloclaude-sync-{os.getpid()}-{branch.replace("/", "-")}.bundle'
+        try:
+            run_as_claude([
+                'git', '-C', str(claude_repo_path),
+                'bundle', 'create', bundle_path, branch
+            ])
+            run_as_claude(['chmod', '644', bundle_path])
+            run_cmd([
+                'git', '-C', str(origin_path),
+                'fetch', bundle_path, f'{branch}:{new_branch}'
+            ])
+        finally:
+            run_as_claude(['rm', '-f', bundle_path], check=False)
+        info(f"Claude's commits synced to new branch: {new_branch}")
+        info(f"You can merge: git merge {new_branch}")
+        return new_branch
+
     # Check sync status before attempting
     status = _check_branch_sync_status(origin_path, branch, claude_head)
 
@@ -1702,15 +1820,36 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Se
         check=False, capture=True
     )
 
-    # Check for unpushed commits relative to source branch
+    # Get the current branch name from the worktree
+    branch_result = run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+        capture=True
+    )
+    branch = branch_result.stdout.strip()
+
+    # Determine what to compare against for "unpushed" commits:
+    # - If the worktree branch exists in origin (was synced before), compare against that
+    # - Otherwise, compare against the source branch (first time sync)
+    worktree_branch_check = run_as_claude(
+        ['git', '-C', str(claude_repo_path), 'rev-parse', '--verify', f'origin/{branch}'],
+        capture=True, check=False
+    )
+    if worktree_branch_check.returncode == 0:
+        # Worktree branch exists in origin - compare against it
+        compare_ref = f'origin/{branch}'
+    else:
+        # First time sync - compare against source branch
+        compare_ref = f'origin/{source_branch}'
+
+    # Check for unpushed commits
     result = run_as_claude(
-        ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'origin/{source_branch}..HEAD'],
+        ['git', '-C', str(claude_repo_path), 'log', '--oneline', f'{compare_ref}..HEAD'],
         capture=True, check=False
     )
     unpushed_commits = result.stdout.strip() if result.returncode == 0 else ""
 
     if not unpushed_commits:
-        info("No unpushed commits.")
+        info("No new commits to sync.")
         return
 
     print()
@@ -1720,13 +1859,6 @@ def handle_end_of_session(claude_repo_path: Path, origin_path: Path, session: Se
 
     if not prompt_yes_no("Sync these commits to your local repo?"):
         return
-
-    # Get the current branch name from the worktree
-    branch_result = run_as_claude(
-        ['git', '-C', str(claude_repo_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
-        capture=True
-    )
-    branch = branch_result.stdout.strip()
 
     synced_branch = _sync_commits_via_bundle(claude_repo_path, origin_path, branch)
     if synced_branch:

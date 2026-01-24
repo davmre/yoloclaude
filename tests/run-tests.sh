@@ -1004,6 +1004,139 @@ test_install_script() {
 }
 
 # ============================================================================
+# Test: Full worktree branch sync workflow
+# This tests the scenario where:
+# 1. Create worktree, make changes, sync back (creates branch locally)
+# 2. User makes changes on that branch in their local repo
+# 3. Resume session - should offer to sync changes into worktree
+# 4. End session with no new changes - should detect nothing to sync
+# ============================================================================
+test_worktree_branch_sync_workflow() {
+    log_test "Testing worktree branch sync workflow..."
+
+    USER_REPO="/home/testuser/repos/test-project"
+    BASE_CLONE="/home/claude/projects/test-project"
+
+    # Ensure we're on main and have a clean state
+    cd "$USER_REPO"
+    git checkout main 2>/dev/null || true
+
+    # Step 1: Create a new worktree session
+    cd /home/testuser
+    log_info "Step 1: Creating initial worktree session..."
+
+    # Sleep briefly to ensure unique timestamp for mock-claude
+    sleep 1
+
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes "$USER_REPO" || true
+
+    # Get the session info
+    SESSION_FILE=$(ls -t /home/testuser/.yoloclaude/sessions/*.json 2>/dev/null | head -1)
+    if [[ -z "$SESSION_FILE" ]]; then
+        log_fail "Step 1: No session file created"
+        return 1
+    fi
+
+    SESSION_ID=$(basename "$SESSION_FILE" .json)
+    BRANCH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['branch'])")
+    WORKTREE_NAME=${BRANCH#claude/}
+    WORKTREE_PATH=$(python3 -c "import json; print(json.load(open('$SESSION_FILE'))['worktree_path'])")
+
+    log_info "Created worktree: $WORKTREE_NAME"
+    log_info "Branch: $BRANCH"
+
+    # Verify the branch was synced back to user's repo (mock claude makes commits)
+    if git -C "$USER_REPO" rev-parse --verify "$BRANCH" &>/dev/null; then
+        log_pass "Step 1: Worktree branch synced to user's repo"
+    else
+        log_fail "Step 1: Worktree branch not found in user's repo"
+        log_info "Available branches:"
+        git -C "$USER_REPO" branch -a | head -10
+        return 1
+    fi
+
+    # Get the commit on both sides - they should match after sync
+    USER_BRANCH_COMMIT=$(git -C "$USER_REPO" rev-parse "$BRANCH")
+    WORKTREE_COMMIT=$(sudo -u claude git -C "$WORKTREE_PATH" rev-parse HEAD)
+
+    if [[ "$USER_BRANCH_COMMIT" == "$WORKTREE_COMMIT" ]]; then
+        log_pass "Step 1: User's branch and worktree are in sync"
+    else
+        log_fail "Step 1: User's branch and worktree should be in sync"
+        log_info "User branch: $USER_BRANCH_COMMIT"
+        log_info "Worktree: $WORKTREE_COMMIT"
+        return 1
+    fi
+
+    # Step 2: User makes changes on the worktree branch in their local repo
+    log_info "Step 2: Making changes on worktree branch in user's repo..."
+    cd "$USER_REPO"
+    git checkout "$BRANCH"
+    echo "User's local edit on worktree branch - $(date)" >> file.txt
+    git add .
+    git commit -m "User edit on worktree branch"
+
+    USER_NEW_COMMIT=$(git rev-parse HEAD)
+    log_info "User made commit: ${USER_NEW_COMMIT:0:7}"
+
+    # Switch back to main to avoid the "checked out" issue
+    git checkout main
+
+    # Step 3: Resume the session - should offer to sync changes into worktree
+    log_info "Step 3: Resuming session (should sync user's changes into worktree)..."
+    cd /home/testuser
+    "$YOLOCLAUDE_DIR/yoloclaude" --yes test-project -w "$WORKTREE_NAME" || true
+
+    # The worktree should now have EITHER:
+    # - The user's commit (if it synced and no new mock commits)
+    # - A newer commit on top of user's commit (if mock claude ran again)
+    # What matters is that user's commit is in the history
+
+    if sudo -u claude git -C "$WORKTREE_PATH" merge-base --is-ancestor "$USER_NEW_COMMIT" HEAD; then
+        log_pass "Step 3: User's commit is in worktree history"
+    else
+        log_fail "Step 3: User's commit should be in worktree history"
+        log_info "User commit: ${USER_NEW_COMMIT:0:7}"
+        log_info "Worktree HEAD: $(sudo -u claude git -C "$WORKTREE_PATH" rev-parse --short HEAD)"
+        log_info "Worktree log:"
+        sudo -u claude git -C "$WORKTREE_PATH" log --oneline -5
+        return 1
+    fi
+
+    # Step 4: Now verify the sync logic works correctly
+    # After the session, user's repo should have worktree's latest commits
+    log_info "Step 4: Verify sync completed correctly..."
+
+    # Fetch to get latest refs
+    sudo -u claude git -C "$WORKTREE_PATH" fetch origin
+
+    # The worktree branch in origin should match or be ancestor of worktree HEAD
+    ORIGIN_BRANCH_COMMIT=$(sudo -u claude git -C "$WORKTREE_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+    WORKTREE_HEAD=$(sudo -u claude git -C "$WORKTREE_PATH" rev-parse HEAD)
+
+    if [[ "$ORIGIN_BRANCH_COMMIT" == "$WORKTREE_HEAD" ]]; then
+        log_pass "Step 4: Worktree and origin branch are in sync"
+    else
+        # Check if origin is ancestor (worktree has new commits that need syncing)
+        if sudo -u claude git -C "$WORKTREE_PATH" merge-base --is-ancestor "$ORIGIN_BRANCH_COMMIT" "$WORKTREE_HEAD" 2>/dev/null; then
+            log_info "Step 4: Worktree has new commits not yet synced (this is OK for test)"
+            log_pass "Step 4: Sync state is consistent"
+        else
+            log_fail "Step 4: Unexpected sync state"
+            log_info "Origin branch: ${ORIGIN_BRANCH_COMMIT:0:7}"
+            log_info "Worktree HEAD: ${WORKTREE_HEAD:0:7}"
+            return 1
+        fi
+    fi
+
+    # Cleanup: switch user repo back to main
+    cd "$USER_REPO"
+    git checkout main 2>/dev/null || true
+
+    log_pass "Worktree branch sync workflow completed successfully"
+}
+
+# ============================================================================
 # Test: Error handling for missing repo
 # ============================================================================
 test_missing_repo() {
@@ -1064,6 +1197,7 @@ main() {
     test_behind_status
     test_fast_forward_resume
     test_backward_compat_source_branch
+    test_worktree_branch_sync_workflow
 
     test_missing_repo
 

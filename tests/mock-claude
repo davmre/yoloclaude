@@ -38,8 +38,8 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
     exit 1
 fi
 
-# Create a test file
-TEST_FILE="claude-test-$(date +%s).txt"
+# Create a test file with unique name (timestamp + random + PID)
+TEST_FILE="claude-test-$(date +%s)-$$-$RANDOM.txt"
 echo "Mock Claude was here at $(date)" > "$TEST_FILE"
 echo "Created file: $TEST_FILE"
 
